@@ -35,11 +35,11 @@ inputs:
     required: false
     type: string
     default: ""
-  prebuilt_dtb:
-    description: 'Do you want to use prebuilt dtb for vendor boot?'
+  compile_dlkm:
+    description: 'Do you want to compile vendor dlkm and vendor boot?'
     required: false
     type: string
-    default: 'true'
+    default: 'false'
 
 outputs:
   vendor_boot_sha256:
@@ -116,6 +116,7 @@ runs:
         echo "::endgroup::"
 
     - name: Aggressive cleanup
+      if: ${{ env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -144,6 +145,7 @@ runs:
         echo "::endgroup::"
 
     - name: Install Minimal Dependencies
+      if: ${{ env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -157,6 +159,7 @@ runs:
         echo "::endgroup::"
 
     - name: Install ccache with ECS by cctv18
+      if: ${{ env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -208,7 +211,7 @@ runs:
         echo "REPO=$REPO" >> "$GITHUB_ENV"
 
     - name: Format Manifest URL
-      if: ${{ inputs.use_custom_repo_parser == 'true' }}
+      if: ${{ inputs.use_custom_repo_parser == 'true'  && env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         if [[ "$MANIFEST" =~ ^https?:// ]]; then
@@ -221,7 +224,7 @@ runs:
         fi
 
     - name: Prepare string to checkout custom branch or revision on custom manifest parser
-      if: ${{ inputs.use_custom_repo_parser == 'true' }}
+      if: ${{ inputs.use_custom_repo_parser == 'true'  && env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         OVERRIDES=""
@@ -242,7 +245,7 @@ runs:
         echo "PROJECT_OVERRIDE=${OVERRIDES#,}" >> "$GITHUB_ENV"
 
     - name: Download source via custom manifest parser
-      if: ${{ inputs.use_custom_repo_parser == 'true' }}
+      if: ${{ inputs.use_custom_repo_parser == 'true'  && env.BUILD_TYPE == 'Modules Only' }}
       uses: nullptr-t-oss/turbo-repo-sync@main
       with:
         manifest_path: ${{ env.MANIFEST }}
@@ -250,7 +253,7 @@ runs:
         project_overrides: ${{ env.PROJECT_OVERRIDE }}
 
     - name: Optimize Global Git for Repo Tool
-      if: ${{ inputs.use_custom_repo_parser == 'false' }}
+      if: ${{ inputs.use_custom_repo_parser == 'false' && env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -262,7 +265,7 @@ runs:
         git config --global index.threads $(nproc)
 
     - name: Initialize and Sync Kernel Source
-      if: ${{ inputs.use_custom_repo_parser == 'false' }}
+      if: ${{ inputs.use_custom_repo_parser == 'false' && env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -289,7 +292,7 @@ runs:
         $success || { echo "repo sync failed after 3 attempts"; exit 1; }
 
     - name: Checkout custom branch or commit hash for sources
-      if: ${{ inputs.use_custom_repo_parser == 'false' }}
+      if: ${{ inputs.use_custom_repo_parser == 'false' && env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -378,6 +381,9 @@ runs:
 
         mkdir -p "$CCACHE_DIR"
 
+        # For mixed and monolithic builds
+        rm -rf "$CCACHE_DIR"
+
         ccache -o compression=false
         ccache -M 5G
 
@@ -403,12 +409,14 @@ runs:
           LTO-${{ env.MODEL }}-modules-${{ inputs.optimize_level }}-
 
     - name: Restore files for Mixed builds
+      if: ${{ env.BUILD_TYPE == 'Modules Only' || env.BUILD_TYPE == 'Mixed Build' }}
       uses: actions/cache/restore@v5
       with:
         path: ${{ env.KBUILD_MIXED_TREE }}
         key: ${{ env.MODEL }}-MIXED-TREE-${{ inputs.optimize_level }}-${{ env.MIXED_KERNEL_VERSION }}
 
     - name: Check for Mixed Tree artifacts
+      if: ${{ env.BUILD_TYPE == 'Modules Only' || env.BUILD_TYPE == 'Mixed Build' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -424,6 +432,7 @@ runs:
         fi
 
     - name: Clone kernel patches for msm kernel
+      if: ${{ env.BUILD_TYPE == 'Modules Only' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -590,7 +599,6 @@ runs:
           OBJDUMP=llvm-objdump
           DEPMOD=depmod
           DTC="$KERNEL_PLATFORM/build/kernel/build-tools/path/linux-x86/dtc"
-          KBUILD_MIXED_TREE="$KBUILD_MIXED_TREE"
           DTC_FLAGS="-@"
           STRIP=llvm-strip
           HOSTCC="ccache clang"
@@ -599,6 +607,12 @@ runs:
           KCFLAGS="$KCFLAGS"
           KCPPFLAGS="$KCPPFLAGS"
         )
+
+        if [[ "$BUILD_TARGET_TYPE" == "Mixed Build" || "$BUILD_TARGET_TYPE" == "Modules Only" ]]; then
+          MAKE_FLAGS+=(
+            KBUILD_MIXED_TREE="$KBUILD_MIXED_TREE"
+          )
+        fi
 
         OUT=out
         INSTALL_MOD_PATH="$MSM/out"
@@ -639,24 +653,30 @@ runs:
         MAKE_FLAGS+=(
           KERNEL_SRC="$ROOT_DIR/$KERNEL_DIR"
         )
-        # OPLUS ext modules list
-        EXT_OPLUS=($(cat "$KERNEL_PLATFORM/oplus/config/modules.ext.$KERNEL_VER.oplus"))
 
-        OPLUS_FLAGS+=(
-            CHIPSET_COMPANY=QCOM
-            OPLUS_VND_BUILD_PLATFORM="$SOC"
-        )
+        if [ -f "$KERNEL_PLATFORM/oplus/config/modules.ext.$KERNEL_VER.oplus" ]; then
+          # OPLUS ext modules list
+          EXT_OPLUS=($(cat "$KERNEL_PLATFORM/oplus/config/modules.ext.$KERNEL_VER.oplus"))
 
-        echo "Compiling vendor modules (oplus)"
-        SECONDS=0
+          OPLUS_FLAGS+=(
+              CHIPSET_COMPANY=QCOM
+              OPLUS_VND_BUILD_PLATFORM="$SOC"
+          )
 
-        # OPLUS ext modules
-        for MODULE in "${EXT_OPLUS[@]}"; do
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}"
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH=$INSTALL_MOD_PATH modules_install
-        done
+          echo "Compiling vendor modules (oplus)"
+          SECONDS=0
 
-        echo "duration_oplus_ext=$SECONDS" >> "$GITHUB_ENV"
+          # OPLUS ext modules
+          for MODULE in "${EXT_OPLUS[@]}"; do
+              make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}"
+              make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH=$INSTALL_MOD_PATH modules_install
+          done
+
+          echo "duration_oplus_ext=$SECONDS" >> "$GITHUB_ENV"
+        else
+          echo "[INFO] OPLUS modules not found. skipping"
+          echo "duration_oplus_ext=0" >> "$GITHUB_ENV"
+        fi
 
         # QCOM ext modules
         EXT_QCOM+=(
@@ -695,6 +715,11 @@ runs:
         SECONDS=0
 
         for MODULE in "${EXT_QCOM[@]}"; do
+            if [ ! -d "MODULE"]; then
+              echo "[WARNING] The following module path does not exist : $MODULE"
+              continue
+            fi
+
             make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}"
             make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$INSTALL_MOD_PATH" modules_install
             export KBUILD_EXTRA_SYMBOLS=$(find "$KERNEL_PLATFORM/vendor" -name "Module.symvers" | tr '\n' ' ')
@@ -720,19 +745,15 @@ runs:
 
     - name: Create dtb.img
       id: create_dtb
+      if: ${{ inputs.compile_dlkm == 'true' }}
       shell: bash
       run: |
         OUT="$MSM/out"
-        if [ "${{ inputs.prebuilt_dtb }}" = "true" ]; then
-          PREBUILTS="https://raw.githubusercontent.com/nullptr-t-oss/kernel_patches/refs/heads/main/prebuilts/$MODEL"
-          if curl -fsSL "$PREBUILTS/vendor_boot/dtb" -o "$OUT/dtb.img"; then
-              echo "Using dtb from prebuilts."
-            else
-              echo "WARNING: dtb not found from prebuilts"
-              DTB_FILE_LIST=$(find "$OUT/dtbs_staging" -name "*.dtb" | sort)
-              cat $DTB_FILE_LIST > "$OUT/dtb.img"
-            fi
+        PREBUILTS="https://raw.githubusercontent.com/nullptr-t-oss/kernel_patches/refs/heads/main/prebuilts/$MODEL"
+        if curl -fsSL "$PREBUILTS/vendor_boot/dtb" -o "$OUT/dtb.img"; then
+          echo "Using dtb from prebuilts."
         else
+          echo "WARNING: dtb not found from prebuilts"
           DTB_FILE_LIST=$(find "$OUT/dtbs_staging" -name "*.dtb" | sort)
           cat $DTB_FILE_LIST > "$OUT/dtb.img"
         fi
@@ -741,6 +762,7 @@ runs:
 
     - name: Create vendor_boot
       id: create_vendor_boot
+      if: ${{ inputs.compile_dlkm == 'true' }}
       shell: bash
       run: |
         PREBUILTS="https://raw.githubusercontent.com/nullptr-t-oss/kernel_patches/refs/heads/main/prebuilts/$MODEL"
@@ -850,6 +872,7 @@ runs:
 
     - name: Create vendor_dlkm
       id: create_vendor_dlkm
+      if: ${{ inputs.compile_dlkm == 'true' }}
       shell: bash
       run: |
         PREBUILTS="https://raw.githubusercontent.com/nullptr-t-oss/kernel_patches/refs/heads/main/prebuilts/$MODEL"

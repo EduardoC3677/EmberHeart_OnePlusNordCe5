@@ -53,6 +53,14 @@ inputs:
     required: false
     type: string
     default: ""
+  msm_branch_or_commit:
+    required: false
+    type: string
+    default: ""
+  vendor_branch_or_commit:
+    required: false
+    type: string
+    default: ""
 
 outputs:
   kernel_version:
@@ -247,18 +255,31 @@ runs:
       if: ${{ inputs.use_custom_repo_parser == 'true' }}
       shell: bash
       run: |
+        OVERRIDES=""
+
         if [[ -n "${{ inputs.common_branch_or_commit }}" ]]; then
           # Calculate the relative path from CONFIG to COMMON
           # coz we'll use this path to find the required project to be modified in manifest
           REL_COMMON=$(realpath --relative-to="$CONFIG" "$COMMON")
           echo "[DEBUG] Calculated relative path: $REL_COMMON"
 
-          OVERRIDE_STR="${REL_COMMON}=${{ inputs.common_branch_or_commit }}"
-          echo "PROJECT_OVERRIDE=$OVERRIDE_STR" >> $GITHUB_ENV
-        else
-          echo "No custom branch or commit specified. Proceeding with default manifest revision."
-          echo "PROJECT_OVERRIDE=" >> $GITHUB_ENV
+          OVERRIDES="${REL_COMMON}=${{ inputs.common_branch_or_commit }}"
         fi
+
+        if [[ -n "${{ inputs.msm_branch_or_commit }}" ]]; then
+          # Calculate the relative path from CONFIG to MSM
+          # coz we'll use this path to find the required project to be modified in manifest
+          REL_MSM=$(realpath --relative-to="$CONFIG" "$MSM")
+          OVERRIDES="$OVERRIDES,${REL_MSM}=${{ inputs.msm_branch_or_commit }}"
+          echo "[DEBUG] Calculated relative path: $REL_MSM"
+        fi
+
+        if [[ -n "${{ inputs.vendor_branch_or_commit }}" ]]; then
+          OVERRIDES="$OVERRIDES,./=${{ inputs.vendor_branch_or_commit }}"
+        fi
+
+        echo "Final override string: ${OVERRIDES#,}"
+        echo "PROJECT_OVERRIDE=${OVERRIDES#,}" >> "$GITHUB_ENV"
 
     - name: Download source via custom manifest parser
       if: ${{ inputs.use_custom_repo_parser == 'true' }}
@@ -322,6 +343,31 @@ runs:
           git fetch --all --depth=1
           git checkout "${{ inputs.common_branch_or_commit }}"
           echo "Current HEAD for COMMON kernel repo is at:"
+          git show HEAD --no-patch
+        fi
+
+        cd "$CONFIG"
+
+        if [[ -z "${{ inputs.vendor_branch_or_commit }}" ]]; then
+          echo "Custom branch or commit not specified, proceeding on current HEAD of vendor modules and device tree branch"
+          echo "Current HEAD for vendor modules repo is at:"
+          git show HEAD --no-patch
+        else
+          git fetch --all --depth=1
+          git checkout "${{ inputs.vendor_branch_or_commit }}"
+          echo "Current HEAD for vendor modules repo is at:"
+          git show HEAD --no-patch
+        fi
+        
+        cd "$MSM"
+        if [[ -z "${{ inputs.msm_branch_or_commit }}" ]]; then
+          echo "Custom branch or commit not specified, proceeding on current HEAD of msm kernel"
+          echo "Current HEAD for MSM kernel repo is at:"
+          git show HEAD --no-patch
+        else
+          git fetch --all --depth=1
+          git checkout "${{ inputs.msm_branch_or_commit }}"
+          echo "Current HEAD for MSM kernel repo is at:"
           git show HEAD --no-patch
         fi
 

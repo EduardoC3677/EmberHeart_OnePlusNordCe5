@@ -21,10 +21,11 @@ on:
         required: true
         type: choice
         options:
-          - Both
           - Kernel Only
           - Modules Only
-        default: Both
+          - Mixed Build
+          - Monolithic Build
+        default: Mixed Build
       manifest:
         description: 'Select manifest'
         required: true
@@ -86,11 +87,11 @@ on:
         description: 'Enter MSM kernel branch or commit hash'
         type: string
         default: ''
-      prebuilt_dtb:
-        description: 'Do you want to use prebuilt dtb for vndr boot?'
+      compile_dlkm:
+        description: '[Under Testing dont use] Do you want to use vendor dlkm and boot partitions?'
         required: true
         type: boolean
-        default: true
+        default: false
       model:
         description: 'Select device to be built'
         required: true
@@ -151,10 +152,86 @@ jobs:
           echo "$wrapped" >> "$GITHUB_OUTPUT"
           echo "MATRIX_EOF" >> "$GITHUB_OUTPUT"
 
+  full-build:
+    name: Build ${{ matrix.model }} EmberHeart Full build
+    needs: set-op-model
+    if: ${{ inputs.build_target == 'Mixed Build' || inputs.build_target == 'Monolithic Build' }}
+    runs-on: ubuntu-latest
+    outputs:
+      kernel_version: ${{ steps.build_kernel.outputs.kernel_version }}
+      ksun_version: ${{ steps.build_kernel.outputs.ksun_version }}
+      ksun_tag: ${{ steps.build_kernel.outputs.ksun_tag }}
+      susfs_version: ${{ steps.build_kernel.outputs.susfs_version }}
+      kernel_sha256: ${{ steps.build_kernel.outputs.kernel_sha256 }}
+      boot_sha256: ${{ steps.build_kernel.outputs.boot_sha256 }}
+      system_dlkm_sha256: ${{ steps.build_kernel.outputs.system_dlkm_sha256 }}
+      vendor_boot_sha256:  ${{ steps.build_modules.outputs.vendor_boot_sha256 }}
+      vendor_dlkm_sha256: ${{ steps.build_modules.outputs.vendor_dlkm_sha256 }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_TYPE: ${{ inputs.build_target }}
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: "content"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_DEPEND: "true"
+      CCACHE_IGNOREOPTIONS: "--sysroot*"
+      CCACHE_DIRECT: "true"
+      CCACHE_FILECLONE: "true"
+      CCACHE_INODE_CACHE: "true"
+      CCACHE_UMASK: "002"
+      CCACHE_SLOPPINESS: "file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale,modules"
+      CCACHE_IS_KERNEL_COMPILING: "true"
+      CCACHE_LOGFILE: "/tmp/kernel_ccache.log"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.set-op-model.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Build Kernel
+        id: build_kernel
+        uses: ./.github/kernel
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.kernel_ccache
+          LDCACHE_DIR: ${{ github.workspace }}/.kernel_lto_cache
+        with:
+          op_config_json: ${{ toJSON(matrix) }}
+          ksun_branch_or_hash: ${{ inputs.ksun_branch }}
+          evict_unused_ccache: ${{ inputs.evict_unused_ccache }}
+          use_custom_repo_parser: ${{ inputs.use_custom_repo_parser }}
+          use_opt_patches: ${{ inputs.use_opt_patches }}
+          use_susfs: ${{ inputs.use_susfs }}
+          susfs_commit_hash_or_branch: ${{ inputs.susfs_branch_or_commit }}
+          optimize_level: ${{ inputs.optimize_level }}
+          kernel_uname: ${{ inputs.kernel_uname }}
+          manifest: ${{ inputs.manifest }}
+          common_branch_or_commit: ${{ inputs.common_branch_or_commit }}
+          msm_branch_or_commit: ${{ inputs.msm_branch_or_commit }}
+          vendor_branch_or_commit: ${{ inputs.vendor_branch_or_commit }}
+
+      - name: Build Kernel Modules
+        id: build_modules
+        uses: ./.github/kernel_modules
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.modules_ccache
+          LDCACHE_DIR: ${{ github.workspace }}/.modules_lto_cache
+        with:
+          op_config_json: ${{ toJSON(matrix) }}
+          optimize_level: ${{ inputs.optimize_level }}
+          manifest: ${{ inputs.manifest }}
+          evict_unused_ccache: ${{ inputs.evict_unused_ccache }}
+          use_custom_repo_parser: ${{ inputs.use_custom_repo_parser }}
+          vendor_branch_or_commit: ${{ inputs.vendor_branch_or_commit }}
+          msm_branch_or_commit: ${{ inputs.msm_branch_or_commit }}
+          compile_dlkm: ${{ inputs.compile_dlkm }}
+
   build-kernel:
     name: Build ${{ matrix.model }} EmberHeart kernel
     needs: set-op-model
-    if: ${{ inputs.build_target == 'Both' || inputs.build_target == 'Kernel Only' }}
+    if: ${{ inputs.build_target == 'Kernel Only' }}
     runs-on: ubuntu-latest
     outputs:
       kernel_version: ${{ steps.build_kernel.outputs.kernel_version }}
@@ -166,6 +243,7 @@ jobs:
       system_dlkm_sha256: ${{ steps.build_kernel.outputs.system_dlkm_sha256 }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_TYPE: ${{ inputs.build_target }}
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.kernel_ccache
       LDCACHE_DIR: ${{ github.workspace }}/.kernel_lto_cache
@@ -205,16 +283,17 @@ jobs:
           manifest: ${{ inputs.manifest }}
           common_branch_or_commit: ${{ inputs.common_branch_or_commit }}
 
-  build-kernel-modules:
+  build-kernel-modules-only:
     name: Build ${{ matrix.model }} Kernel Modules
     needs: set-op-model
-    if: ${{ inputs.build_target == 'Both' || inputs.build_target == 'Modules Only' }}
+    if: ${{ inputs.build_target == 'Modules Only' }}
     runs-on: ubuntu-latest
     outputs:
       vendor_boot_sha256:  ${{ steps.build_modules.outputs.vendor_boot_sha256 }}
       vendor_dlkm_sha256: ${{ steps.build_modules.outputs.vendor_dlkm_sha256 }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_TYPE: ${{ inputs.build_target }}
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.modules_ccache
       LDCACHE_DIR: ${{ github.workspace }}/.modules_lto_cache
@@ -249,12 +328,11 @@ jobs:
           use_custom_repo_parser: ${{ inputs.use_custom_repo_parser }}
           vendor_branch_or_commit: ${{ inputs.vendor_branch_or_commit }}
           msm_branch_or_commit: ${{ inputs.msm_branch_or_commit }}
-          prebuilt_dtb: ${{ inputs.prebuilt_dtb }}
+          compile_dlkm: ${{ inputs.compile_dlkm }}
 
   trigger-release:
     needs:
-      - build-kernel
-      - build-kernel-modules
+      - full-build
     runs-on: ubuntu-latest
     if: ${{ inputs.release_type != 'none' && inputs.build_target == 'Both' }}
     env:
