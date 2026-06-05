@@ -213,7 +213,6 @@ jobs:
         with:
           ksun_branch_or_hash: ${{ inputs.ksun_branch }}
           evict_unused_ccache: ${{ inputs.evict_unused_ccache }}
-          use_custom_repo_parser: ${{ inputs.use_custom_repo_parser }}
           use_opt_patches: ${{ inputs.use_opt_patches }}
           use_susfs: ${{ inputs.use_susfs }}
           susfs_commit_hash_or_branch: ${{ inputs.susfs_branch_or_commit }}
