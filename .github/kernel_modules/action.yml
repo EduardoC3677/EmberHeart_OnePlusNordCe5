@@ -409,7 +409,7 @@ runs:
           LTO-${{ env.MODEL }}-modules-${{ inputs.optimize_level }}-
 
     - name: Restore files for Mixed builds
-      if: ${{ env.BUILD_TYPE == 'Modules Only' || env.BUILD_TYPE == 'Mixed Build' }}
+      if: ${{ env.BUILD_TYPE == 'Modules Only' }}
       uses: actions/cache/restore@v5
       with:
         path: ${{ env.KBUILD_MIXED_TREE }}
