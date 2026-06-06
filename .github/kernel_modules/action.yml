@@ -181,8 +181,20 @@ runs:
         make ARCH=arm64 mrproper
         mkdir -p "$OUT"
 
-        # Merge defconfig fragments from vendor/$SOC_GKI.config
-        ./scripts/kconfig/merge_config.sh -O "$OUT" -m arch/arm64/configs/gki_defconfig arch/arm64/configs/vendor/${SOC}_GKI.config
+        CONFIGS=(
+          "arch/arm64/configs/gki_defconfig"
+        )
+
+        if [ -f "arch/arm64/configs/vendor/${SOC}_GKI.config" ]; then
+          CONFIGS+=("arch/arm64/configs/vendor/${SOC}_GKI.config")
+        fi
+
+        if [ -f "arch/arm64/configs/vendor/oplus/${SOC}_GKI.config" ]; then
+          CONFIGS+=("arch/arm64/configs/vendor/oplus/${SOC}_GKI.config")
+        fi
+
+        # Merge defconfig fragments
+        ./scripts/kconfig/merge_config.sh -O "$OUT" -m "${CONFIGS[@]}"
 
         cp "$OUT/.config" arch/arm64/configs/gki_defconfig
         rm "$OUT/.config"
