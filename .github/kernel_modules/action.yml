@@ -405,6 +405,7 @@ runs:
 
         # Exports for external kernel modules
         export BOARD_PLATFORM=kalama
+        export TARGET_BOARD_PLATFORM=kalama
         export ROOT_DIR=$KERNEL_PLATFORM
 
         if [[ "$BUILD_TYPE" == "Mixed Build" || "$BUILD_TYPE" == "Modules Only" ]]; then
