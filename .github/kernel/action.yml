@@ -926,7 +926,11 @@ runs:
         echo "Kernel built 😆"
 
         cp "$OUT/System.map" "$ARTIFACTS_DIR_DEBUG"
-        cp "$OUT/Module.symvers" "$ARTIFACTS_DIR_DEBUG"
+
+        if [[ "$BUILD_TYPE" == "Mixed Build" || "$BUILD_TYPE" == "Modules Only" ]]; then
+          cp "$OUT/Module.symvers" "$ARTIFACTS_DIR_DEBUG"
+        fi
+
         cp "$OUT/vmlinux" "$ARTIFACTS_DIR_DEBUG"
 
         echo "::endgroup::"
