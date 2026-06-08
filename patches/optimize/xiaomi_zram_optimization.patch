@@ -1,0 +1,29 @@
+commit e12cc73bad4c95c19f9491ffebc135e84998d62e (adapted for mt6897 / GKI android14-6.1)
+Author: ztc1997 <dev@ztc1997.com>
+Date:   Sat May 11 07:12:55 2024 +0800
+
+    drivers/block: Import Xiaomi's zram optimization changes
+
+    - From branch: `bsp-vermeer-t-oss`
+    - Adaptado para el Nord CE5 (mt6897): en el GKI 6.1 de OnePlus el
+      bi_opf se fija directamente en la llamada a bio_alloc(), no con el
+      patron antiguo `bio->bi_opf = REQ_OP_READ`. Se aplica REQ_PRIO al
+      argumento opf de bio_alloc para priorizar el IO de writeback de zram.
+
+    Change-Id: I9ff6ebb63ad4e92e31d0c559ea0c554ec72c5118
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -611,8 +611,9 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
+ {
+ 	struct bio *bio;
+ 
+-	bio = bio_alloc(zram->bdev, 1, parent ? parent->bi_opf : REQ_OP_READ,
+-			GFP_NOIO);
++	bio = bio_alloc(zram->bdev, 1,
++			(parent ? parent->bi_opf : REQ_OP_READ) | REQ_PRIO,
++			GFP_NOIO);
+ 	if (!bio)
+ 		return -ENOMEM;
+ 

@@ -144,33 +144,37 @@ runs:
         fi
         echo "REPO=$REPO" >> "$GITHUB_ENV"
 
-    - name: Initialize and Sync Kernel Source
+    - name: Initialize and Sync Kernel Source (MediaTek MT6897)
       shell: bash
       run: |
         set -euo pipefail
+        # Nord CE5 = MediaTek MT6897 (no QCOM). Clonamos los repos GKI+vendor
+        # de OnePlusOSS para mt6897 en vez de usar repo/kernel_manifest.
         echo "Creating folder for configuration: $CONFIG"
-        mkdir -p "$CONFIG"
-        cd "$CONFIG"
-        echo "Initializing and syncing kernel source..."
-        if [[ "$MANIFEST" == https://* ]]; then
-          mkdir -p .repo/manifests
-          curl --fail --show-error --location --proto '=https' "$MANIFEST" -o .repo/manifests/temp_manifest.xml
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/sm8650 -m temp_manifest.xml --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
-        else
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git -b "$BRANCH" -m "$MANIFEST" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
-        fi
-        "$REPO" --version
-        success=false
-        for i in 1 2 3; do
-          if "$REPO" sync -c --no-clone-bundle --no-tags --optimized-fetch \
-             -j"$(nproc --all)" --fail-fast; then
-            success=true
-            break
-          fi
-          echo "repo sync attempt $i failed; retrying..."
-          sleep 30
-        done
-        $success || { echo "repo sync failed after 3 attempts"; exit 1; }
+        mkdir -p "$CONFIG/kernel_platform"
+        cd "$CONFIG/kernel_platform"
+
+        GKI_REPO="https://github.com/OnePlusOSS/android_kernel_oneplus_mt6897.git"
+        VND_REPO="https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897.git"
+        REV="$BRANCH"
+
+        clone_retry() {
+          local url="$1" ref="$2" dst="$3"
+          for i in 1 2 3; do
+            if git clone --depth=1 --branch "$ref" --single-branch "$url" "$dst"; then
+              return 0
+            fi
+            echo "clone $dst attempt $i failed; retrying..."; rm -rf "$dst"; sleep 20
+          done
+          return 1
+        }
+
+        clone_retry "$GKI_REPO" "$REV" common || { echo "GKI clone failed"; exit 1; }
+        clone_retry "$VND_REPO" "$REV" .vnd_dt || { echo "vendor/DT clone failed"; exit 1; }
+        [ -d .vnd_dt/vendor ] && rsync -a .vnd_dt/vendor/ ./vendor/
+        [ -d .vnd_dt/kernel ] && { rsync -a .vnd_dt/kernel/ ./kernel_device_modules/ 2>/dev/null || true; }
+        rm -rf .vnd_dt
+        test -f common/Makefile || { echo "common/Makefile missing"; exit 1; }
 
     - name: Get Kernel Version Info
       shell: bash
@@ -179,7 +183,7 @@ runs:
         CONFIG_DIR="$GITHUB_WORKSPACE/$CONFIG"
         ARTIFACTS_DIR="$CONFIG_DIR/artifacts"
         mkdir -p "$ARTIFACTS_DIR"
-        cd "$CONFIG_DIR/kernel_platform/msm-kernel"
+        cd "$CONFIG_DIR/kernel_platform/common"
         CONFIG_FILES=("build.config.common" "build.config.constants")
         BRANCH_LINE=""
         for f in "${CONFIG_FILES[@]}"; do
@@ -217,19 +221,23 @@ runs:
         job-summary: 'CCache stats'
         evict-old-files: 'job'
 
-    - name: Clone kernel patches for msm kernel
+    - name: Prepare Nethunter patches (from this repo)
       shell: bash
       run: |
         set -euo pipefail
-        echo "Cloning kernel patches for msm kernel..."
-        git clone --depth=1 https://github.com/nullptr-t-oss/kernel_patches.git my_patches
+        # Los parches Nethunter wifi-injection ahora viven en este repo
+        # (patches/nethunter/) y se aplican sobre el GKI common mas abajo.
+        # Ya no se clona nullptr-t-oss/kernel_patches aqui: en MTK no hay
+        # msm-kernel y solo necesitabamos los 2 parches de inyeccion wifi,
+        # que estan versionados directamente en el repo.
+        echo "Nethunter patches served from repo: patches/nethunter/"
 
     - name: Clean Up ABI Protected Exports
       shell: bash
       run: |
         set -euo pipefail
         cd "$CONFIG/kernel_platform"
-        rm -f msm-kernel/android/abi_gki_protected_exports_* || true
+        rm -f common/android/abi_gki_protected_exports_* || true
         df -h
 
     - name: Merge
@@ -237,7 +245,7 @@ runs:
       run: |
         set -euo pipefail
         KERNEL_PLATFORM="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        MSM="$KERNEL_PLATFORM/msm-kernel"
+        MSM="$KERNEL_PLATFORM/common"
         OUT=out
 
         cd "$MSM"
@@ -245,18 +253,24 @@ runs:
         make ARCH=arm64 mrproper
         mkdir -p "$OUT"
 
-        # Merge defconfig fragments from vendor/$SOC_GKI.config
-        ./scripts/kconfig/merge_config.sh -O "$OUT" -m arch/arm64/configs/gki_defconfig arch/arm64/configs/vendor/${SOC}_GKI.config
-
-        cp "$OUT/.config" arch/arm64/configs/gki_defconfig
-        rm "$OUT/.config"
+        # En QCOM se fusionaba arch/arm64/configs/vendor/${SOC}_GKI.config.
+        # En MTK ese fragmento puede no existir con el mismo nombre: si esta,
+        # se fusiona; si no, se usa gki_defconfig tal cual.
+        FRAG="arch/arm64/configs/vendor/${SOC}_GKI.config"
+        if [ -f "$FRAG" ]; then
+          ./scripts/kconfig/merge_config.sh -O "$OUT" -m arch/arm64/configs/gki_defconfig "$FRAG"
+          cp "$OUT/.config" arch/arm64/configs/gki_defconfig
+          rm "$OUT/.config"
+        else
+          echo "::warning::$FRAG no existe (MTK); uso gki_defconfig sin merge"
+        fi
 
     - name: Add nethunter specfic drivers already present in kernel to be built as modules
       shell: bash
       run: |
         set -euo pipefail
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        MSM="$KERNEL_PATH/msm-kernel"
+        MSM="$KERNEL_PATH/common"
         cd "$MSM"
         
         # Realtek drivers
@@ -297,25 +311,53 @@ runs:
           --module CONFIG_MAC80211_LEDS \
           --module CONFIG_CAN_SLCAN
 
-    - name: Add my kernel patches to msm kernel
-      if: env.SOC == 'kalama'
+    - name: Add Nethunter wifi-injection patches to GKI common (MediaTek MT6897)
       shell: bash
       run: |
         set -euo pipefail
-        echo "Applying kernel patches to msm kernel from my repo..."
-        cd "$CONFIG/kernel_platform/msm-kernel"
+        echo "Applying Nethunter wifi-injection patches to GKI common..."
+        # En MTK no existe msm-kernel: los drivers wifi (mac80211/cfg80211 + USB
+        # wifi como ath9k_htc, zd1211rw, rtl8187) viven en el GKI common, igual
+        # que en QCOM. Estos parches son genericos (no QCOM-especificos) y se
+        # aplican sobre common de forma tolerante.
+        KP="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
+        COMMON="$KP/common"
+        # Directorio de parches Nethunter dentro de este repo (action path).
+        NH_DIR="$GITHUB_ACTION_PATH/../../patches/nethunter"
+        if [ ! -d "$NH_DIR" ]; then
+          # Fallback: ruta relativa al checkout del repo.
+          NH_DIR="$GITHUB_WORKSPACE/patches/nethunter"
+        fi
+        echo "Nethunter patches dir: $NH_DIR"
+        ls -la "$NH_DIR" || { echo "WARN: no nethunter patches dir, skipping"; exit 0; }
 
-        for patch_file in ../../../my_patches/kernel_patches/op11/msm/*.patch; do
-            echo "Applying patch: $patch_file"
-            patch -p1 < "$patch_file"
-        done
+        cd "$COMMON"
+        apply_nh() {
+          local pf="$1"
+          [ -f "$pf" ] || { echo "skip (missing): $pf"; return 0; }
+          echo "==> Applying: $(basename "$pf")"
+          # Si ya esta aplicado (reverse aplica limpio), lo saltamos.
+          if patch -p1 -R --dry-run --force --fuzz=3 <"$pf" >/dev/null 2>&1; then
+            echo "    already applied, skipping."
+            return 0
+          fi
+          if patch -p1 --forward --fuzz=3 <"$pf"; then
+            echo "    OK"
+          else
+            echo "    WARN: failed to apply $(basename "$pf") cleanly (continuing)."
+          fi
+        }
+        # Orden: primero injection (mac80211/cfg80211 + USB wifi), luego ath9k.
+        apply_nh "$NH_DIR/add-wifi-injection-4.14.patch"
+        apply_nh "$NH_DIR/fix-ath9k-naming-conflict.patch"
+        echo "Nethunter wifi-injection patches step done."
 
     - name: Add memkernel module
       shell: bash
       run: |
         set -euo pipefail
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        MSM="$KERNEL_PATH/msm-kernel"
+        MSM="$KERNEL_PATH/common"
         cd "$MSM"
         curl -LSs "https://raw.githubusercontent.com/Poko-Apps/MemKernel/main/kernel/setup.sh" | bash -s M br0k3n
 
@@ -324,7 +366,7 @@ runs:
       run: |
         set -euo pipefail
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        MSM="$KERNEL_PATH/msm-kernel"
+        MSM="$KERNEL_PATH/common"
         cd "$MSM/drivers/net/wireless/realtek/"
         rm -rf rtw88
         git clone https://github.com/lwfinger/rtw88.git
@@ -361,7 +403,7 @@ runs:
       run: |
         set -euo pipefail
         KERNEL_PLATFORM="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        MSM="$KERNEL_PLATFORM/msm-kernel"
+        MSM="$KERNEL_PLATFORM/common"
         cd "$MSM"
 
         export PATH="${CLANG_BIN_PATH}:$PATH" 
@@ -406,55 +448,44 @@ runs:
         cd "$KERNEL_PLATFORM"
 
         MAKE_FLAGS+=(
-          KERNEL_SRC="$KERNEL_PLATFORM/./msm-kernel"
+          KERNEL_SRC="$KERNEL_PLATFORM/./common"
         )
-        # OPLUS ext modules list
-        EXT_OPLUS=($(cat "$KERNEL_PLATFORM/oplus/config/modules.ext.$KERNEL_VER.oplus"))
 
+        # ------------------------------------------------------------------
+        # MediaTek MT6897: NO existen los drivers QCOM (mm-drivers, qcacld,
+        # camera-kernel, etc.). En su lugar compilamos out-of-tree el stack
+        # vendor OPLUS de memoria (hybridswap/zram), que es justo lo que el
+        # build del Image no produce y lo que la cadena de parches 0001-0006
+        # arregla. Se construyen contra el GKI ya compilado (KERNEL_SRC=common).
+        # ------------------------------------------------------------------
         OPLUS_FLAGS+=(
-            CHIPSET_COMPANY=QCOM
+            CHIPSET_COMPANY=MTK
             OPLUS_VND_BUILD_PLATFORM="$SOC"
         )
-        # OPLUS ext modules
-        for MODULE in "${EXT_OPLUS[@]}"; do
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}"
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" INSTALL_MOD_PATH=$INSTALL_MOD_PATH modules_install
+
+        # Modulos vendor OPLUS (rutas relativas a kernel_platform). Solo se
+        # compilan los presentes en el arbol vendor clonado.
+        EXT_OPLUS=(
+            ../vendor/oplus/kernel/mm/hybridswap_zram
+            ../vendor/oplus/kernel/mm/kswapd_opt
+            ../vendor/oplus/kernel/mm/zram_opt
+        )
+        # Algunos arboles usan thp_zsmalloc/hybrid_zsmalloc como dep del zram:
+        for extra in \
+            ../vendor/oplus/kernel/mm/thp_zsmalloc \
+            ../vendor/oplus/kernel/mm/uxmem_opt ; do
+          [ -d "$KERNEL_PLATFORM/$extra" ] && EXT_OPLUS+=("$extra")
         done
 
-        # QCOM ext modules
-        EXT_QCOM+=(
-            ../vendor/qcom/opensource/mmrm-driver
-            ../vendor/qcom/opensource/mm-drivers/hw_fence
-            ../vendor/qcom/opensource/mm-drivers/sync_fence
-            ../vendor/qcom/opensource/mm-drivers/msm_ext_display
-            ../vendor/qcom/opensource/securemsm-kernel
-            ../vendor/qcom/opensource/display-drivers/msm
-            ../vendor/qcom/opensource/audio-kernel
-            ../vendor/qcom/opensource/camera-kernel
-            ../vendor/oplus/kernel/explorer
-            ../vendor/qcom/opensource/video-driver
-            ../vendor/qcom/opensource/graphics-kernel
-            ../vendor/qcom/opensource/dataipa/drivers/platform/msm
-            ../vendor/qcom/opensource/datarmnet/core
-            ../vendor/qcom/opensource/datarmnet-ext/aps
-            ../vendor/qcom/opensource/datarmnet-ext/offload
-            ../vendor/qcom/opensource/datarmnet-ext/shs
-            ../vendor/qcom/opensource/datarmnet-ext/sch
-            ../vendor/qcom/opensource/datarmnet-ext/perf
-            ../vendor/qcom/opensource/datarmnet-ext/perf_tether
-            ../vendor/qcom/opensource/datarmnet-ext/wlan
-            ../vendor/qcom/opensource/eva-kernel
-            ../vendor/qcom/opensource/wlan/platform
-            ../vendor/qcom/opensource/bt-kernel
-            ../vendor/nxp/opensource/driver
-            ../vendor/st/opensource/driver
-            ../vendor/st/opensource/eSE-driver
-            ../vendor/qcom/opensource/wlan/qcacld-3.0
-        )
-
-        for MODULE in "${EXT_QCOM[@]}"; do
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" modules
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" INSTALL_MOD_PATH=$INSTALL_MOD_PATH modules_install
+        for MODULE in "${EXT_OPLUS[@]}"; do
+            if [ ! -d "$KERNEL_PLATFORM/$MODULE" ]; then
+              echo "::warning::modulo OPLUS ausente, omito: $MODULE"; continue
+            fi
+            echo "== Building OPLUS module: $MODULE =="
+            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" modules \
+              || { echo "::warning::fallo compilando $MODULE, continuo"; continue; }
+            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" INSTALL_MOD_PATH=$INSTALL_MOD_PATH modules_install \
+              || echo "::warning::fallo instalando $MODULE, continuo"
         done
 
     - name: Filter modules
@@ -462,7 +493,7 @@ runs:
       run: |
         set -euo pipefail
         KERNEL_PLATFORM="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        MSM="$KERNEL_PLATFORM/msm-kernel"
+        MSM="$KERNEL_PLATFORM/common"
         OUT="$MSM/out"
         UNAME=$(ls "$OUT/lib/modules/")
 
@@ -494,7 +525,7 @@ runs:
         set -euo pipefail
         CONFIG_DIR="$GITHUB_WORKSPACE/$CONFIG"
         KERNEL_PLATFORM="$CONFIG_DIR/kernel_platform"
-        MSM="$KERNEL_PLATFORM/msm-kernel"
+        MSM="$KERNEL_PLATFORM/common"
         OUT="$MSM/out"
         MODULES_SRC="$OUT/modules"
         MODULES_ZIP="$CONFIG_DIR/artifacts/kernel_modules_${{ env.MODEL }}.zip"

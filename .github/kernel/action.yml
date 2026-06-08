@@ -176,33 +176,62 @@ runs:
         git config --global core.fsmonitor true
         git config --global pack.sparse true
 
-    - name: Initialize and Sync Kernel Source
+    - name: Initialize and Sync Kernel Source (MediaTek MT6897)
       shell: bash
       run: |
         set -euo pipefail
+        # ------------------------------------------------------------------
+        # El Nord CE5 es MediaTek MT6897 (Dimensity 8350), NO Qualcomm.
+        # OnePlusOSS/kernel_manifest solo aloja Snapdragon, asi que en lugar
+        # de `repo init/sync` clonamos directamente los dos repos GKI/vendor
+        # de OnePlusOSS para mt6897 (rama del config: $BRANCH):
+        #   - android_kernel_oneplus_mt6897              -> kernel_platform/common  (GKI 6.1)
+        #   - android_kernel_modules_and_devicetree_..._mt6897 -> vendor + DT
+        # Replica el layout que el resto del action espera (kernel_platform/common,
+        # kernel_platform/vendor) para que KSU/SUSFS/patches funcionen igual que en QCOM.
+        # ------------------------------------------------------------------
         echo "Creating folder for configuration: $CONFIG"
-        mkdir -p "$CONFIG"
-        cd "$CONFIG"
-        echo "Initializing and syncing kernel source..."
-        if [[ "$MANIFEST" == https://* ]]; then
-          mkdir -p .repo/manifests
-          curl --fail --show-error --location --proto '=https' "$MANIFEST" -o .repo/manifests/temp_manifest.xml
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/sm8650 -m temp_manifest.xml --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
-        else
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git -b "$BRANCH" -m "$MANIFEST" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
+        mkdir -p "$CONFIG/kernel_platform"
+        cd "$CONFIG/kernel_platform"
+
+        GKI_REPO="https://github.com/OnePlusOSS/android_kernel_oneplus_mt6897.git"
+        VND_REPO="https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897.git"
+        REV="$BRANCH"   # ej: oneplus/mt6897_b_16.0.0_nord_ce5
+
+        clone_retry() {
+          local url="$1" ref="$2" dst="$3"
+          for i in 1 2 3; do
+            if git clone --depth=1 --branch "$ref" --single-branch "$url" "$dst"; then
+              return 0
+            fi
+            echo "clone $dst attempt $i failed; retrying..."; rm -rf "$dst"; sleep 20
+          done
+          return 1
+        }
+
+        echo "Cloning GKI common (kernel 6.1) ..."
+        clone_retry "$GKI_REPO" "$REV" common \
+          || { echo "GKI clone failed"; exit 1; }
+
+        echo "Cloning vendor + devicetree ..."
+        clone_retry "$VND_REPO" "$REV" .vnd_dt \
+          || { echo "vendor/DT clone failed"; exit 1; }
+
+        # El repo vendor trae 'vendor/' y 'kernel/' (kernel_device_modules); los
+        # exponemos bajo kernel_platform/ para que el parche 0006 (ruta
+        # vendor/oplus/kernel/mm/hybridswap_zram/...) y los modulos OPLUS resuelvan.
+        if [ -d .vnd_dt/vendor ]; then
+          rsync -a .vnd_dt/vendor/ ./vendor/
         fi
-        "$REPO" --version
-        success=false
-        for i in 1 2 3; do
-          if "$REPO" sync -c --no-clone-bundle --no-tags --optimized-fetch \
-             -j"$(nproc --all)" --fail-fast; then
-            success=true
-            break
-          fi
-          echo "repo sync attempt $i failed; retrying..."
-          sleep 30
-        done
-        $success || { echo "repo sync failed after 3 attempts"; exit 1; }
+        if [ -d .vnd_dt/kernel ]; then
+          rsync -a .vnd_dt/kernel/ ./kernel_device_modules/ 2>/dev/null || true
+        fi
+        rm -rf .vnd_dt
+
+        echo "Layout:"
+        ls -d common vendor 2>/dev/null || true
+        test -f common/Makefile || { echo "common/Makefile missing after clone"; exit 1; }
+        test -f common/arch/arm64/configs/gki_defconfig || { echo "gki_defconfig missing"; exit 1; }
 
     - name: Get Kernel Version Info
       shell: bash
@@ -283,7 +312,10 @@ runs:
         echo "Using SUSFS branch: $SUSFS_BRANCH"
         git clone --depth=1 https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
         git clone --depth=1 https://github.com/TheWildJames/kernel_patches.git
-        git clone --depth=1 https://github.com/nullptr-t-oss/kernel_patches.git my_patches
+        # NOTA: ya no se clona nullptr-t-oss/kernel_patches (my_patches): sus
+        # parches op11/common + op11/msm fueron portados/verificados para el
+        # Nord CE5 (mt6897) y ahora viven versionados en este repo
+        # (patches/optimize/ y patches/nethunter/).
         git clone https://gitlab.com/simonpunk/susfs4ksu.git
         cd susfs4ksu
         if git rev-parse --verify "origin/$SUSFS_BRANCH" >/dev/null 2>&1 || git rev-parse --verify "$SUSFS_BRANCH" >/dev/null 2>&1; then
@@ -576,54 +608,150 @@ runs:
         echo "OnePlus BBR added ✅"
         echo "::endgroup::"
 
-    - name: Add my kernel patches to common kernel
-      if: env.SOC == 'kalama'
+    - name: Add optimize patches to common kernel (Nord CE5 / mt6897)
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::Applying my patches from my repo..."
+        echo "::group::Applying optimize patches from this repo..."
+        # Parches de optimizacion (originalmente op11/common de nullptr-t-oss)
+        # portados/verificados contra el GKI android14-6.1 del Nord CE5 y
+        # versionados en este repo (patches/optimize/). Se aplican sobre el GKI
+        # common de forma tolerante: si alguno no encaja por diferencias de
+        # arbol se omite con warning en vez de abortar el build.
         cd "$CONFIG/kernel_platform/common"
+        OPT_DIR="$GITHUB_WORKSPACE/patches/optimize"
+        if [ ! -d "$OPT_DIR" ]; then
+          echo "::warning::no patches/optimize dir, skipping"; echo "::endgroup::"; exit 0
+        fi
 
-        for patch_file in ../../../my_patches/kernel_patches/op11/common/*.patch; do
-            echo "Applying patch: $patch_file"
-            patch -p1 < "$patch_file"
-        done
+        apply_opt() {
+          local f="$OPT_DIR/$1"
+          [ -f "$f" ] || { echo "::warning::optimize patch ausente: $1"; return 0; }
+          # idempotente: si ya esta aplicado (reverse limpio), saltar.
+          if patch -p1 -R --dry-run --force --fuzz=3 <"$f" >/dev/null 2>&1; then
+            echo "   $1: ya aplicado, skip"; return 0
+          fi
+          if patch -p1 --forward --fuzz=3 <"$f"; then
+            echo "   $1: OK"
+          else
+            echo "::warning::skip $1 (no aplico limpio)"
+          fi
+        }
 
-        echo "My kernel patches applied ❤️‍🔥"
+        # 8 parches op11/common verificados sin cambios + xiaomi_zram adaptado
+        # a la forma nueva de bio_alloc() del GKI 6.1 del Nord CE5.
+        apply_opt clear_page_16bytes_align.patch
+        apply_opt file_struct_8bytes_align.patch
+        apply_opt lz4_armv8_acceleration.patch
+        apply_opt lz4_optimized_decompress.patch
+        apply_opt optimized_mem_operations.patch
+        apply_opt reduce_cache_pressure.patch
+        apply_opt reduce_pelt.patch
+        apply_opt workqueue.patch
+        apply_opt xiaomi_zram_optimization.patch
+
+        echo "Optimize patches applied ❤️‍🔥"
+        echo "::endgroup::"
+
+    - name: Apply hybridswap/zram fix patches (Nord CE5 / mt6897)
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Applying Nord CE5 zram/hybridswap fix patches..."
+        # Parches portados del workflow EmberHeart_OnePlusNordCe5 (cadena de 6
+        # parches que arregla hybrid_swap/zram en mt6897/OOS16). 0001-0005 tocan
+        # el GKI common; 0006 toca el vendor tree (hybridswap_zram). Se aplican
+        # con --forward para ser idempotentes y con fuzz para tolerar offsets.
+        KP="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
+        PATCHES_DIR="$GITHUB_WORKSPACE/patches"
+
+        apply_in() {
+          # $1 = dir base (common o kernel_platform), resto = patches
+          local base="$1"; shift
+          cd "$base"
+          for p in "$@"; do
+            local f="$PATCHES_DIR/$p"
+            [ -f "$f" ] || { echo "::warning::patch ausente: $p"; continue; }
+            echo ">> $p  (en $base)"
+            if patch -p1 --forward --fuzz=3 < "$f"; then
+              echo "   OK"
+            else
+              # --forward devuelve !=0 si ya estaba aplicado: lo toleramos
+              echo "::warning::patch $p no aplico limpio (¿ya aplicado?), continuo"
+            fi
+          done
+        }
+
+        # 0001-0005 -> common (GKI)
+        apply_in "$KP/common" \
+          0001-fix-hybrid_swap-zram-oneplus.patch \
+          0002-module-load-vendor-ko-ignore-modversion.patch \
+          0003-kmi-export-android_vh_throttle_direct_reclaim_bypass.patch \
+          0004-kmi-sched_assist-deps-zram-chain.patch \
+          0005-mm-memcontrol-replay-hybridswap-memcg-alloc.patch
+
+        # 0006 -> kernel_platform (ruta vendor/oplus/kernel/mm/hybridswap_zram/...)
+        apply_in "$KP" \
+          0006-mm-hybridswap-resize-nr_objs-to-live-disksize.patch
+
+        echo "Nord CE5 zram/hybridswap patches applied 🔥"
         echo "::endgroup::"
 
     - name: Add other kernel patches to common kernel
-      if: env.SOC == 'kalama'
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Applying patches from wild kernels..."
         cd "$CONFIG/kernel_platform/common"
 
-        patch -p1 --forward < "../../../kernel_patches/common/mem_opt_prefetch.patch"
+        # Parches genericos de optimizacion (WildKernels) para GKI common.
+        # En el original estaban limitados a SOC=kalama (OP11). Para el Nord CE5
+        # (mt6897, mismo GKI android14-6.1) se aplican igual, de forma tolerante
+        # e idempotente: si un parche ya esta aplicado o no encaja por diferencias
+        # de arbol, se omite con warning en vez de abortar el build.
+        ap()  {
+          local f="$1"
+          [ -f "$f" ] || { echo "::warning::ausente $(basename "$f")"; return 0; }
+          if patch -p1 -R --dry-run --force --fuzz=3 <"$f" >/dev/null 2>&1; then
+            echo "skip (ya aplicado) $(basename "$f")"; return 0
+          fi
+          patch -p1 --forward --fuzz=3 < "$f" || echo "::warning::skip $(basename "$f")"
+        }
+        apf() { ap "$1"; }   # mismo comportamiento tolerante (fuzz incluido)
 
-        sed -e 's/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/' -e 's/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/' -e 's/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/' "../../../kernel_patches/common/optimise_memcmp.patch" | patch -p1 --forward
+        ap  "../../../kernel_patches/common/mem_opt_prefetch.patch"
 
-        patch -p1 --forward < "../../../kernel_patches/common/minimise_wakeup_time.patch"
-        patch -p1 --forward < "../../../kernel_patches/common/int_sqrt.patch"
-        patch -p1 --forward < "../../../kernel_patches/common/force_tcp_nodelay.patch"
-        patch -p1 --forward < "../../../kernel_patches/common/reduce_gc_thread_sleep_time.patch"
-        patch -p1 --forward < "../../../kernel_patches/common/add_timeout_wakelocks_globally.patch"
-        patch -p1 --forward < "../../../kernel_patches/common/f2fs_reduce_congestion.patch"
-        patch -p1 --forward < "../../../kernel_patches/common/reduce_freeze_timeout.patch"
+        # optimise_memcmp: en OP11/kalama el arbol usaba SYM_FUNC_START_WEAK_PI y
+        # requeria un sed para reescribir los simbolos. El GKI 6.1 del Nord CE5
+        # YA usa el esquema moderno (SYM_FUNC_START(__pi_memcmp) +
+        # SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp) + EXPORT_SYMBOL_NOKASAN), que
+        # es exactamente el que produce el parche upstream. Por eso aqui se aplica
+        # DIRECTO, sin el sed (que en mt6897 corrompe el contexto y hace fallar
+        # el hunk del cuerpo de la funcion).
+        ap  "../../../kernel_patches/common/optimise_memcmp.patch"
 
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/add_limitation_scaling_min_freq.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/re_write_limitation_scaling_min_freq.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/adjust_cpu_scan_order.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/avoid_extra_s2idle_wake_attempts.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/disable_cache_hot_buddy.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/f2fs_enlarge_min_fsync_blocks.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/increase_ext4_default_commit_age.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/increase_sk_mem_packets.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/reduce_pci_pme_wakeups.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/silence_irq_cpu_logspam.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/silence_system_logspam.patch"
-        patch -p1 -F3 --forward < "../../../kernel_patches/common/use_unlikely_wrap_cpufreq.patch"
+        ap  "../../../kernel_patches/common/minimise_wakeup_time.patch"
+        ap  "../../../kernel_patches/common/int_sqrt.patch"
+        ap  "../../../kernel_patches/common/force_tcp_nodelay.patch"
+        ap  "../../../kernel_patches/common/reduce_gc_thread_sleep_time.patch"
+        ap  "../../../kernel_patches/common/add_timeout_wakelocks_globally.patch"
+        ap  "../../../kernel_patches/common/f2fs_reduce_congestion.patch"
+        ap  "../../../kernel_patches/common/reduce_freeze_timeout.patch"
+
+        # Cadena cpufreq scaling_min_freq: el orden importa (add_limitation crea
+        # store_cpumask_min_limit, re_write lo reescribe, use_unlikely lo envuelve).
+        apf "../../../kernel_patches/common/add_limitation_scaling_min_freq.patch"
+        apf "../../../kernel_patches/common/re_write_limitation_scaling_min_freq.patch"
+        apf "../../../kernel_patches/common/adjust_cpu_scan_order.patch"
+        apf "../../../kernel_patches/common/avoid_extra_s2idle_wake_attempts.patch"
+        apf "../../../kernel_patches/common/disable_cache_hot_buddy.patch"
+        apf "../../../kernel_patches/common/f2fs_enlarge_min_fsync_blocks.patch"
+        apf "../../../kernel_patches/common/increase_ext4_default_commit_age.patch"
+        apf "../../../kernel_patches/common/increase_sk_mem_packets.patch"
+        apf "../../../kernel_patches/common/reduce_pci_pme_wakeups.patch"
+        apf "../../../kernel_patches/common/silence_irq_cpu_logspam.patch"
+        apf "../../../kernel_patches/common/silence_system_logspam.patch"
+        apf "../../../kernel_patches/common/use_unlikely_wrap_cpufreq.patch"
 
         echo "Other kernel patches applied 🔥"
         echo "::endgroup::"

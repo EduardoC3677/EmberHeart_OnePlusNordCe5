@@ -1,0 +1,72 @@
+From: OnePlus Nord CE5 Kernel Workflow <kernel@local>
+Date: 2026-06-08
+Subject: [PATCH] mm/zram: fix broken hybrid_swap (RAM expansion) by NOT hijacking
+ zram0 on OnePlus mt6897 (OOS16)
+
+PROBLEM (observed on-device, dmesg/logcat):
+
+    lowmemorykiller: /sys/block/zram0/hybridswap_meminfo open:
+                     No such file or directory
+    lowmemorykiller: Failed to parse swap info, But ignore!
+
+ROOT CAUSE:
+
+OnePlus/Oppo ship a FULL-SOURCE proprietary memory-compression driver
+("hybridswap_zram") in the vendor tree
+(vendor/oplus/kernel/mm/hybridswap_zram). It is compiled with Bazel as
+the loadable module  oplus_bsp_hybridswap_zram.ko  and shipped inside
+vendor_dlkm. That module is the ONE that registers /dev/zram0 on stock,
+and it exposes OPLUS-private sysfs attributes used by userspace
+(lowmemorykiller / "RAM expansion" / RSM), notably:
+
+    /sys/block/zram0/hybridswap_meminfo   (zram_drv.c: DEVICE_ATTR_RO)
+
+Its Kconfig is deliberately mutually exclusive with the upstream driver:
+
+    config HYBRIDSWAP_ZRAM
+        depends on BLOCK && SYSFS && HYBRID_ZSMALLOC && CRYPTO && !ZRAM
+
+Consequently the OnePlus GKI common tree:
+  1. comments out the upstream zram build in drivers/block/Makefile
+     ("# obj-$(CONFIG_ZRAM) += zram/"), and
+  2. ships CONFIG_ZRAM=m in gki_defconfig (ABI placeholder only).
+
+so that the vendor module owns the "zram" block-major and the zram0 node.
+
+THE BUG IN COMMUNITY KERNELS (incl. an earlier rev of this very tree):
+to "make zram work", custom GKI/KernelSU builds force the UPSTREAM zram
+driver in (CONFIG_ZRAM=y + uncomment the Makefile). On a device whose
+vendor_dlkm still carries oplus_bsp_hybridswap_zram.ko, the built-in
+upstream driver registers /sys/block/zram0 FIRST -- but WITHOUT the
+hybridswap_meminfo attribute. The vendor module can then no longer own
+zram0. Userspace opens /sys/block/zram0/hybridswap_meminfo and gets
+ENOENT -> RAM expansion + hybrid swap are dead.
+
+THE FIX:
+Do NOT hijack zram0 from the vendor module. Keep the upstream zram driver
+OUT of the GKI Image (Makefile entry commented, CONFIG_ZRAM=m, never =y)
+exactly like stock, so the proprietary oplus_bsp_hybridswap_zram.ko from
+vendor_dlkm remains the sole owner of /dev/zram0 and re-exposes
+hybridswap_meminfo. This patch enforces that correct state (idempotent
+no-op on a stock tree; reverts the anti-pattern on a tree that forced
+upstream zram in).
+
+This is a CONFIGURATION-level fix: the working zram/RAM-expansion stack
+lives entirely in the vendor module (which our GKI Image's stable KMI is
+compatible with -- every other vendor module loads fine on-device); the
+GKI Image must simply stay out of its way.
+
+---
+--- a/drivers/block/Makefile
++++ b/drivers/block/Makefile
+@@ -32,7 +32,9 @@ obj-$(CONFIG_BLK_DEV_DRBD)     += drbd/
+ obj-$(CONFIG_BLK_DEV_RBD)     += rbd.o
+ obj-$(CONFIG_BLK_DEV_PCIESSD_MTIP32XX)	+= mtip32xx/
+ 
+-# obj-$(CONFIG_ZRAM) += zram/
++# zram0 is owned by the OPLUS vendor module oplus_bsp_hybridswap_zram.ko
++# (provides /sys/block/zram0/hybridswap_meminfo). Do NOT build upstream zram.
++# obj-$(CONFIG_ZRAM) += zram/	# keep DISABLED: vendor module owns zram0
+ obj-$(CONFIG_BLK_DEV_RNBD)	+= rnbd/
+ 
+ obj-$(CONFIG_BLK_DEV_NULL_BLK)	+= null_blk/

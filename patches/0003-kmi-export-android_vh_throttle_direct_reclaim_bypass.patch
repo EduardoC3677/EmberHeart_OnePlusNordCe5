@@ -1,0 +1,50 @@
+From: Hermes Workflow <kernel@local>
+Date: Sun, 8 Jun 2026 11:00:00 +0000
+Subject: [PATCH] kmi: declare+export android_vh_throttle_direct_reclaim_bypass
+
+OPLUS's out-of-tree module oplus_bsp_zram_opt.ko (part of the
+hybridswap/zram stack on OnePlus Nord CE5, OOS16) registers the
+vendor hook android_vh_throttle_direct_reclaim_bypass via
+register_trace_android_vh_throttle_direct_reclaim_bypass().
+
+This hook exists in OPLUS's kernel tree but is NOT present in the
+WildKernels GKI 6.1 source. As a result the symbol
+__tracepoint_android_vh_throttle_direct_reclaim_bypass is undefined,
+the module fails to load with "Unknown symbol", and the whole
+zram/hybridswap module chain never initializes -> /dev/block/zram0
+and /sys/block/zram0/hybridswap_meminfo never appear.
+
+Ignoring vermagic/CRC (modversion patch) does NOT fix this: a missing
+symbol is a hard load failure, unrelated to version magic.
+
+Declaring the hook in trace/hooks/mm.h and exporting it from
+drivers/android/vendor_hooks.c provides the three required symbols
+(__tracepoint_/__traceiter_/__SCK__tp_func_) so the module resolves
+and loads.
+
+The signature TP_PROTO(bool *bypass) was reverse-engineered from the
+module callback vh_android_vh_throttle_direct_reclaim_bypass(): it
+takes the tracepoint data pointer plus one argument (a bool* that the
+callback writes to). This matches the convention of the existing
+*_bypass hooks in this header.
+
+---
+--- a/include/trace/hooks/mm.h
++++ b/include/trace/hooks/mm.h
+@@ -318,6 +318,9 @@ DECLARE_HOOK(android_vh_filemap_map_pages_range,
+ DECLARE_HOOK(android_vh_calculate_totalreserve_pages,
+ 	TP_PROTO(bool *skip),
+ 	TP_ARGS(skip));
++DECLARE_HOOK(android_vh_throttle_direct_reclaim_bypass,
++	TP_PROTO(bool *bypass),
++	TP_ARGS(bypass));
+ #endif /* _TRACE_HOOK_MM_H */
+ 
+ /* This part must be outside protection */
+--- a/drivers/android/vendor_hooks.c
++++ b/drivers/android/vendor_hooks.c
+@@ -343,3 +343,4 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_read_pages);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_alloc_pages_reclaim_bypass);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_alloc_pages_failure_bypass);
++EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_throttle_direct_reclaim_bypass);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_madvise_pageout_swap_entry);

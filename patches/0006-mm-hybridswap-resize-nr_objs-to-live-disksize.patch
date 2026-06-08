@@ -1,0 +1,133 @@
+From: hermes-agent <kernel@oneplus-nord-ce5>
+Date: Mon, 8 Jun 2026 21:30:00 +0000
+Subject: [PATCH 0006] mm/hybridswap: rebuild hs_swap when zram->disksize grew
+ past the frozen nr_objs (root-cause fix for HYB_ZRAM "index invalid" flood)
+
+ROOT CAUSE (verified on-device, OnePlus Nord CE5 / mt6897, OOS16):
+
+The HYB_ZRAM log floods at boot with FOUR signatures that all cascade from
+a SINGLE failed bounds check:
+
+    hybridswap_zram_lru_add:3790 index = 2067925 invalid
+    hybridswap_zram_lru_del:3810 index = ... invalid
+    obj_idx:1398 idx = ... invalid
+    get_obj_table_node:1443 idx = -22 invalid
+    hs_list_get_mcgid:1147 idx = -22, table = 0000000000000000
+
+Mechanism (one bug, not four):
+  1. lru_add/del() and obj_idx() reject any zram slot index >= nr_objs and
+     obj_idx() returns -EINVAL (-22).
+  2. That -22 flows into get_obj_table_node(-22) -> idx < 0 -> NULL.
+  3. idx_node(-22) == NULL -> hs_list_get_mcgid() logs "table = 0" and
+     returns 0. So "table = 0000000000000000" is the propagated -22, NOT a
+     NULL per-memcg oem_data table (this supersedes the premise of 0005).
+
+Why nr_objs is short:
+  * hs_swap->nr_objs is frozen as (ori_size >> PAGE_SHIFT) in
+    alloc_hybridswap(), ori_size = zram->disksize captured when
+    hybridswap_mgr_init() runs (driven by the hybridswap_core_enable sysfs
+    write).
+  * zram->table is sized in zram_meta_alloc() from the FINAL zram->disksize
+    set by disksize_store().
+  * On this device the enable fires while disksize is still ~7.5 GiB
+    (nr_objs ~= 1.96M), then zram is reset (zram_reset_device() calls
+    hybridswap_unbind() but NOT hybridswap_mgr_deinit(), so the stale
+    hs_swap survives) and resized to the final 8 GiB (disksize>>12 =
+    2097152 slots). The re-enable then hits the
+    "if (hybridswap_core_enabled() || !en) return 0;" guard in
+    hybridswap_set_enable_init() and never rebuilds hs_swap.
+  * Result: zram hands out slot indices up to 2097151 while hs_swap still
+    believes nr_objs ~= 1967786. Every slot in the gap is rejected -> the
+    flood, and hybridswap silently refuses to track/reclaim those pages
+    (the feature is half-broken, not merely noisy). Confirmed on-device:
+    /sys/block/zram0/disksize = 8589934592 and the lowest rejected index
+    in the logs (~1967786) is below 2097152.
+
+FIX (root cause, not silencing):
+  Make hs_swap sizing track the live zram->disksize.
+
+  (a) hybridswap_mgr_init(): if a stale hs_swap already exists whose
+      nr_objs does not match (zram->disksize >> PAGE_SHIFT), free it first
+      so the following alloc_hybridswap() rebuilds it at the correct size.
+      Makes mgr_init idempotent / self-healing.
+  (b) hybridswap_set_enable_init(): relax the early-return guard so that
+      when already enabled but the live disksize no longer matches the
+      frozen nr_objs, we mgr_deinit + rebuild instead of returning 0.
+      Steady-state (sizes match) keeps the original cheap early-return, so
+      this is a no-op on every boot where the ordering was benign.
+
+Both paths only act on a real size mismatch; no slot index is ever clamped
+or silenced. KMI-safe: no new exported symbol, no struct layout change
+(nr_objs/disksize are existing fields), module-internal only.
+
+NOTE on 0005: it replayed android_vh_mem_cgroup_alloc to populate per-memcg
+oem_data tables from the GKI side. Given the mechanism proven here, the
+"table = 0" line is the propagated -22, not a NULL oem_data slot, so 0005
+does not address this flood. 0005 is harmless (idempotent replay) and is
+left in place; drop it separately once this patch is confirmed to clear the
+logs.
+
+Signed-off-by: hermes-agent <kernel@oneplus-nord-ce5>
+---
+diff --git a/vendor/oplus/kernel/mm/hybridswap_zram/hybridswap/hybridswap.c b/vendor/oplus/kernel/mm/hybridswap_zram/hybridswap/hybridswap.c
+--- a/vendor/oplus/kernel/mm/hybridswap_zram/hybridswap/hybridswap.c
++++ b/vendor/oplus/kernel/mm/hybridswap_zram/hybridswap/hybridswap.c
+@@ -2680,9 +2680,33 @@
+ {
+ 	int ret;
+ 
+-	if (hybridswap_core_enabled() || !en)
++	if (!en)
+ 		return 0;
+ 
++	/*
++	 * Self-healing re-enable: hybridswap may already be enabled with an
++	 * hs_swap whose nr_objs was frozen against an earlier (smaller)
++	 * zram->disksize -- e.g. enabled at ~7.5G, then zram reset and
++	 * resized to 8G without rebuilding the manager (zram_reset_device()
++	 * only unbinds, it does not mgr_deinit). In that case the object
++	 * table is too short and every slot index in the gap is rejected.
++	 * Detect the size mismatch and rebuild instead of early-returning.
++	 */
++	if (hybridswap_core_enabled()) {
++		struct zram *zram = global_settings.zram;
++
++		if (!zram || !zram->hs_swap)
++			return 0;
++		if ((int)(zram->disksize >> PAGE_SHIFT) == zram->hs_swap->nr_objs)
++			return 0;
++
++		log_info("disksize grew (nr_objs %d, disksize pages %lu); rebuilding hs_swap\n",
++			 zram->hs_swap->nr_objs,
++			 (unsigned long)(zram->disksize >> PAGE_SHIFT));
++		hybridswap_mgr_deinit(zram);
++		/* fall through to rebuild below */
++	}
++
+ 	if (!global_settings.stat) {
+ 		log_err("global_settings.stat is null!\n");
+ 
+@@ -3606,6 +3630,23 @@
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Idempotent / self-healing: if a stale hs_swap survives from an
++	 * earlier enable (its nr_objs was frozen against a smaller
++	 * disksize), free it so the alloc below rebuilds it sized to the
++	 * live zram->disksize. Without this the object table stays short
++	 * forever and zram slot indices beyond the old nr_objs are all
++	 * rejected (HYB_ZRAM "index invalid" flood + lost reclaim).
++	 */
++	if (zram->hs_swap &&
++	    zram->hs_swap->nr_objs != (int)(zram->disksize >> PAGE_SHIFT)) {
++		log_info("stale hs_swap nr_objs %d != disksize pages %lu; freeing for rebuild\n",
++			 zram->hs_swap->nr_objs,
++			 (unsigned long)(zram->disksize >> PAGE_SHIFT));
++		free_hybridswap(zram->hs_swap);
++		zram->hs_swap = NULL;
++	}
++
+ 	zram->hs_swap = alloc_hybridswap(zram->disksize,
+ 					 zram->nr_pages << PAGE_SHIFT);
+ 	if (!zram->hs_swap) {

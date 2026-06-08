@@ -1,0 +1,123 @@
+From: OnePlus Nord CE5 Kernel Workflow <kernel@local>
+Date: 2026-06-08
+Subject: [PATCH] module: load stock vendor_dlkm modules despite MODVERSIONS/vermagic mismatch
+
+PROBLEM (observed on device, dmesg/logcat with the recompiled GKI kernel flashed):
+  The recompiled GKI Image (with KernelSU-Next + SUSFS + extra features, built
+  with a different LOCALVERSION / toolchain / .config than the OEM kernel) has
+  different per-symbol CRCs (CONFIG_MODVERSIONS=y) and a different vermagic
+  string than the OEM kernel the stock vendor_dlkm .ko modules were built
+  against. As a result the in-kernel module loader rejects the stock vendor
+  modules:
+
+    <module>: disagrees about version of symbol <sym>      (check_version -> CRC)
+    <module>: version magic 'X' should be 'Y'  -> -ENOEXEC  (same_magic -> vermagic)
+
+  Because oplus_bsp_hybridswap_zram.ko (the vendor driver that owns /dev/zram0
+  and exposes /sys/block/zram0/hybridswap_meminfo) lives in the *stock*
+  vendor_dlkm and is NOT rebuilt by this workflow, it failed to load -> zram /
+  hybrid_swap / RAM-expansion stayed dead.
+
+FIX:
+  Make the two module-version gates in kernel/module/version.c unconditionally
+  accept the module, so every stock vendor .ko loads on the recompiled GKI image
+  regardless of MODVERSIONS CRC or vermagic differences.
+
+    - check_version(): always return 1 (skip the per-symbol CRC comparison).
+    - same_magic():    always return 1 (skip the vermagic string comparison).
+
+  This is safe here because:
+    * The GKI KMI keeps the exported-symbol ABI stable, so the CRC/vermagic
+      delta is a build-time artifact of the different LOCALVERSION/toolchain,
+      not a real ABI break (all the other vendor modules already proved KMI
+      compatibility by loading fine on the device).
+    * CONFIG_MODULE_SIG_FORCE is not set, so module signature is advisory only;
+      no extra signing gate blocks the stock modules.
+
+  Equivalent in spirit to `modprobe --force-vermagic --force-modversion`, but
+  applied kernel-wide so init/ueventd auto-loading of vendor_dlkm modules works.
+
+NOTE: loading modules built for a different kernel will taint the kernel
+(TAINT_FORCED_MODULE). That is expected and harmless for this use case.
+
+--- a/kernel/module/version.c
++++ b/kernel/module/version.c
+@@ -13,44 +13,19 @@ int check_version(const struct load_info *info,
+ 		  const char *symname,
+ 			 struct module *mod,
+ 			 const s32 *crc)
+ {
+-	Elf_Shdr *sechdrs = info->sechdrs;
+-	unsigned int versindex = info->index.vers;
+-	unsigned int i, num_versions;
+-	struct modversion_info *versions;
+-
+-	/* Exporting module didn't supply crcs?  OK, we're already tainted. */
+-	if (!crc)
+-		return 1;
+-
+-	/* No versions at all?  modprobe --force does this. */
+-	if (versindex == 0)
+-		return try_to_force_load(mod, symname) == 0;
+-
+-	versions = (void *)sechdrs[versindex].sh_addr;
+-	num_versions = sechdrs[versindex].sh_size
+-		/ sizeof(struct modversion_info);
+-
+-	for (i = 0; i < num_versions; i++) {
+-		u32 crcval;
+-
+-		if (strcmp(versions[i].name, symname) != 0)
+-			continue;
+-
+-		crcval = *crc;
+-		if (versions[i].crc == crcval)
+-			return 1;
+-		pr_debug("Found checksum %X vs module %lX\n",
+-			 crcval, versions[i].crc);
+-		goto bad_version;
+-	}
+-
+-	/* Broken toolchain. Warn once, then let it go.. */
+-	pr_warn_once("%s: no symbol version for %s\n", info->name, symname);
++	/*
++	 * OnePlus Nord CE5 (OOS16) workflow patch:
++	 * Accept any module regardless of symbol CRC (MODVERSIONS) mismatch so
++	 * that stock vendor_dlkm modules (e.g. oplus_bsp_hybridswap_zram.ko)
++	 * built against the OEM kernel still load on this recompiled GKI image.
++	 * The GKI KMI guarantees ABI stability for the exported symbol set, so
++	 * a CRC delta here is a build-time artifact, not a real ABI break.
++	 */
++	(void)info;
++	(void)symname;
++	(void)mod;
++	(void)crc;
+ 	return 1;
+-
+-bad_version:
+-	pr_warn("%s: disagrees about version of symbol %s\n", info->name, symname);
+-	return 0;
+ }
+ 
+ int check_modstruct_version(const struct load_info *info,
+@@ -80,11 +55,15 @@ int check_modstruct_version(const struct load_info *info,
+ int same_magic(const char *amagic, const char *bmagic,
+ 	       bool has_crcs)
+ {
+-	if (has_crcs) {
+-		amagic += strcspn(amagic, " ");
+-		bmagic += strcspn(bmagic, " ");
+-	}
+-	return strcmp(amagic, bmagic) == 0;
++	/*
++	 * OnePlus Nord CE5 (OOS16) workflow patch:
++	 * Always treat the vermagic as matching. The recompiled GKI image has a
++	 * different vermagic string (LOCALVERSION / compiler / config deltas)
++	 * than the OEM kernel the stock vendor modules were built against, which
++	 * would otherwise make module loading fail with -ENOEXEC
++	 * ("version magic '...' should be '...'"). Ignore the difference.
++	 */
++	return 1;
+ }
+ 
+ /*

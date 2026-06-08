@@ -1,0 +1,106 @@
+From: Hermes Workflow <kernel@local>
+Date: Sun, 8 Jun 2026 12:30:00 +0000
+Subject: [PATCH] kmi: provide sched_assist deps to unblock zram/hybridswap chain
+
+ROOT CAUSE (verified against the stock firmware dump modules.dep):
+
+  oplus_bsp_zram_opt.ko        depends on oplus_bsp_sched_assist.ko
+  oplus_bsp_hybridswap_zram.ko depends on oplus_bsp_sched_assist.ko
+
+oplus_bsp_sched_assist.ko fails to load on the WildKernels GKI 6.1
+build with six "Unknown symbol" errors (err -2). Because the zram and
+hybridswap modules list sched_assist as a hard dependency, modprobe
+never even attempts them once sched_assist fails -> /dev/block/zram0
+and /sys/block/zram0/hybridswap_meminfo never appear, zram + hybridswap
++ RAM expansion are all dead. This is the real blocker; patch 0003
+(throttle_direct_reclaim_bypass) fixed a module that was NOT on the
+zram dependency chain.
+
+The six missing symbols fall into two classes:
+
+1) Plain GPL exports that EXIST in the GKI source but are not exported:
+     css_task_iter_start  (kernel/cgroup/cgroup.c)
+     css_task_iter_next   (kernel/cgroup/cgroup.c)
+     css_task_iter_end    (kernel/cgroup/cgroup.c)
+     cpu_cgrp_subsys      (kernel/sched/core.c)
+   -> add EXPORT_SYMBOL_GPL after each definition.
+
+2) Vendor hooks that OPLUS added to its own vmlinux but are absent from
+   the WildKernels GKI:
+     android_vh_reweight_entity
+     android_vh_sched_move_task
+   -> declare them in include/trace/hooks/sched.h. This emits the
+   __tracepoint_/__traceiter_/__SCK__tp_func_ symbols the module needs
+   to resolve register_trace_android_vh_*(). The hooks have no call
+   sites in GKI, so the probe sched_assist registers simply never fires
+   (the UX-boost reweight tweak becomes a no-op) -- but the MODULE
+   LOADS, which is all that is required to unblock its zram/hybridswap
+   dependents. CRC/vermagic is already neutralised by patch 0002, so
+   only symbol existence matters here; signatures are taken from the
+   ACK android14-6.1 vendor-hook convention (task_struct pointer for
+   sched_move_task; the reweight callback was confirmed by disassembly
+   to take a single sched_entity pointer in x1).
+
+After this patch sched_assist resolves all 167 of its imports, loads,
+and modprobe proceeds to oplus_bsp_zram_opt.ko and
+oplus_bsp_hybridswap_zram.ko.
+
+---
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -4992,6 +4992,7 @@ void css_task_iter_start(struct cgroup_subsys_state *css, unsigned int flags,
+ 
+ 	spin_unlock_irq(&css_set_lock);
+ }
++EXPORT_SYMBOL_GPL(css_task_iter_start);
+ 
+ /**
+  * css_task_iter_next - return the next task for the iterator
+@@ -5025,6 +5026,7 @@ struct task_struct *css_task_iter_next(struct css_task_iter *it)
+ 
+ 	return it->cur_task;
+ }
++EXPORT_SYMBOL_GPL(css_task_iter_next);
+ 
+ /**
+  * css_task_iter_end - finish task iteration
+@@ -5047,6 +5049,7 @@ void css_task_iter_end(struct css_task_iter *it)
+ 	if (it->cur_task)
+ 		put_task_struct(it->cur_task);
+ }
++EXPORT_SYMBOL_GPL(css_task_iter_end);
+ 
+ static void cgroup_procs_release(struct kernfs_open_file *of)
+ {
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -11766,6 +11766,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
+ 	.early_init	= true,
+ 	.threaded	= true,
+ };
++EXPORT_SYMBOL_GPL(cpu_cgrp_subsys);
+ 
+ #endif	/* CONFIG_CGROUP_SCHED */
+ 
+--- a/include/trace/hooks/sched.h
++++ b/include/trace/hooks/sched.h
+@@ -465,6 +465,14 @@ DECLARE_HOOK(android_vh_set_task_comm,
+ 	TP_PROTO(struct task_struct *p),
+ 	TP_ARGS(p));
+ 
++DECLARE_HOOK(android_vh_reweight_entity,
++	TP_PROTO(struct sched_entity *se),
++	TP_ARGS(se));
++
++DECLARE_HOOK(android_vh_sched_move_task,
++	TP_PROTO(struct task_struct *tsk),
++	TP_ARGS(tsk));
++
+ #endif /* _TRACE_HOOK_SCHED_H */
+--- a/kernel/sched/vendor_hooks.c
++++ b/kernel/sched/vendor_hooks.c
+@@ -117,3 +117,5 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_prio_restore);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_task_ux_op);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_set_task_comm);
++EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_reweight_entity);
++EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_sched_move_task);

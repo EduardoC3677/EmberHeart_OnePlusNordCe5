@@ -1,0 +1,84 @@
+From: hermes-agent <kernel@oneplus-nord-ce5>
+Date: Mon, 8 Jun 2026 00:00:00 +0000
+Subject: [PATCH 0005] mm/memcontrol: replay android_vh_mem_cgroup_alloc for hybridswap backlog
+
+The OPLUS hybridswap vendor module (oplus_bsp_hybridswap_zram.ko) is a
+self-contained zram replacement loaded from vendor_dlkm in second stage,
+after init has already created dozens of memory cgroups. It attaches its
+per-memcg object table from inside the android_vh_mem_cgroup_alloc vendor
+hook, which only fires on *new* memcg allocation, so every memcg that
+already existed at insmod time keeps a NULL oem_data table and hybridswap
+floods dmesg with "table = 0000000000000000 / idx = -22 invalid".
+
+Fix: a late_initcall delayed work waits (static-key poll) for the vendor
+probe to register, then walks every live memcg via mem_cgroup_iter() and
+replays the alloc hook. The vendor mem_cgroup_alloc_hook early-returns when
+android_oem_data1[0] is already set (verified by disassembly: ldr x8,[x1,
+0x8e0]; cbnz x8), so the replay is idempotent. KMI-safe: no new exported
+symbol, reuses the existing android_vh_mem_cgroup_alloc tracepoint.
+
+Signed-off-by: hermes-agent <kernel@oneplus-nord-ce5>
+---
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5716,6 +5716,59 @@
+ 	lru_gen_release_memcg(memcg);
+ }
+ 
++/*
++ * OPLUS hybridswap replay: the vendor hybridswap module (loaded from
++ * vendor_dlkm, i.e. well after init has already created dozens of memory
++ * cgroups) attaches its per-memcg object table inside
++ * android_vh_mem_cgroup_alloc. Because that probe only fires when a *new*
++ * memcg is allocated, every memcg that already existed when the module was
++ * inserted is left with a NULL table (android_oem_data1[0] == 0), which is
++ * exactly the "table = 0000000000000000 / idx = -22 invalid" flood seen in
++ * HYB_ZRAM logs.
++ *
++ * Fix: once the vendor probe is registered, walk every live memcg and replay
++ * the alloc hook on it. The vendor probe is idempotent -- it bails out early
++ * for any memcg whose oem_data slot is already populated -- so replaying is
++ * safe both for the backlog and for any memcg the live hook already handled.
++ */
++static void memcg_hybridswap_replay_work(struct work_struct *work);
++static DECLARE_DELAYED_WORK(memcg_hybridswap_replay_dwork,
++			    memcg_hybridswap_replay_work);
++static unsigned int memcg_hybridswap_replay_tries;
++
++/* poll every 200ms, give up after ~240s of uptime if no module ever loads */
++#define MEMCG_HYBRIDSWAP_REPLAY_INTERVAL_MS	200
++#define MEMCG_HYBRIDSWAP_REPLAY_MAX_TRIES	1200
++
++static void memcg_hybridswap_replay_work(struct work_struct *work)
++{
++	struct mem_cgroup *memcg;
++
++	if (!trace_android_vh_mem_cgroup_alloc_enabled()) {
++		if (++memcg_hybridswap_replay_tries <
++		    MEMCG_HYBRIDSWAP_REPLAY_MAX_TRIES)
++			schedule_delayed_work(&memcg_hybridswap_replay_dwork,
++				msecs_to_jiffies(
++					MEMCG_HYBRIDSWAP_REPLAY_INTERVAL_MS));
++		return;
++	}
++
++	for (memcg = mem_cgroup_iter(NULL, NULL, NULL); memcg;
++	     memcg = mem_cgroup_iter(NULL, memcg, NULL))
++		trace_android_vh_mem_cgroup_alloc(memcg);
++}
++
++static int __init memcg_hybridswap_replay_init(void)
++{
++	if (mem_cgroup_disabled())
++		return 0;
++
++	schedule_delayed_work(&memcg_hybridswap_replay_dwork,
++		msecs_to_jiffies(MEMCG_HYBRIDSWAP_REPLAY_INTERVAL_MS));
++	return 0;
++}
++late_initcall(memcg_hybridswap_replay_init);
++
+ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);

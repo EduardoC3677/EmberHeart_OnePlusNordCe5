@@ -51,8 +51,8 @@ on:
         required: true
         type: choice
         options:
-          - OP11
-        default: OP11
+          - OP-NORD-CE-5
+        default: OP-NORD-CE-5
 
 jobs:
   set-op-model:

@@ -1,0 +1,12 @@
+{
+  "model": "OP-NORD-CE-5",
+  "soc": "mt6897",
+  "branch": "oneplus/mt6897_b_16.0.0_nord_ce5",
+  "manifest_oos16": "oneplus_nord_ce5_b.xml",
+  "manifest_oos16_modules": "oneplus_nord_ce5_b.xml",
+  "manifest_oos16_custom": "oneplus_nord_ce5_b.xml",
+  "manifest_oos16_custom_modules": "oneplus_nord_ce5_b.xml",
+  "android_version": "android14",
+  "kernel_version": "6.1",
+  "hmbird": false
+}
