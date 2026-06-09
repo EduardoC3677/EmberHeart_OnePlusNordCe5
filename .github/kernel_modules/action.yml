@@ -315,8 +315,10 @@ runs:
           --module CONFIG_MT7921E
 
         # Other configs
+        # MAC80211_LEDS es 'bool' (no tristate): debe ir como =y, no como modulo.
+        # Ponerlo como --module producia "symbol value 'm' invalid for MAC80211_LEDS".
         ./scripts/config --file arch/arm64/configs/gki_defconfig \
-          --module CONFIG_MAC80211_LEDS \
+          --enable CONFIG_MAC80211_LEDS \
           --module CONFIG_CAN_SLCAN
 
     - name: Add Nethunter wifi-injection patches to GKI common (MediaTek MT6897)
