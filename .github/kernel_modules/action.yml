@@ -176,6 +176,57 @@ runs:
         rm -rf .vnd_dt
         test -f common/Makefile || { echo "common/Makefile missing"; exit 1; }
 
+    - name: Apply hybridswap/zram fix patches (modules job — Nord CE5 / mt6897)
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Applying Nord CE5 zram/hybridswap fix patches (modules job)"
+        # CRITICO: el hybridswap.ko que se EMPAQUETA y corre en el dispositivo lo
+        # produce ESTE job (build out-of-tree de vendor/oplus/.../hybridswap_zram).
+        # El job de kernel aplica 0001-0006 a SU arbol pero NO compila este .ko.
+        # Si no aplicamos aqui la misma cadena, el .ko es efectivamente stock:
+        #   - 0006 (vendor hybridswap.c) NO entra -> nr_objs queda congelado corto
+        #     -> flood en runtime: "obj_idx idx invalid / get_obj_table_node -22 /
+        #        hs_list_get_mcgid table=0 / hybridswap_zram_lru_del index invalid".
+        #   - 0001-0005 (GKI common) deben aplicarse al common de ESTE job para que
+        #     el .ko se compile/enlace contra el MISMO source KMI que el boot.img.
+        KP="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
+        PATCHES_DIR="$GITHUB_WORKSPACE/patches"
+
+        apply_in() {
+          local base="$1"; shift
+          cd "$base"
+          for p in "$@"; do
+            local f="$PATCHES_DIR/$p"
+            [ -f "$f" ] || { echo "::warning::patch ausente: $p"; continue; }
+            echo ">> $p  (en $base)"
+            # Idempotencia REAL: reverse SIN fuzz (estricto). Solo si el parche ya
+            # esta integro lo saltamos; un reverse fuzzy daria falso positivo.
+            if patch -p1 -R --dry-run --force <"$f" >/dev/null 2>&1; then
+              echo "   ya aplicado (reverse limpio), skip"
+              continue
+            fi
+            if patch -p1 --forward --fuzz=3 <"$f"; then
+              echo "   OK"
+            else
+              echo "::error::patch $p NO aplico en el modules job"; exit 1
+            fi
+          done
+        }
+
+        # 0001-0005 -> common (GKI) de este job; 0006 -> vendor (hybridswap.c)
+        apply_in "$KP/common" \
+          0001-fix-hybrid_swap-zram-oneplus.patch \
+          0002-module-load-vendor-ko-ignore-modversion.patch \
+          0003-kmi-export-android_vh_throttle_direct_reclaim_bypass.patch \
+          0004-kmi-sched_assist-deps-zram-chain.patch \
+          0005-mm-memcontrol-replay-hybridswap-memcg-alloc.patch
+        apply_in "$KP" \
+          0006-mm-hybridswap-resize-nr_objs-to-live-disksize.patch
+
+        echo "Nord CE5 zram/hybridswap patches applied in modules job 🔥"
+        echo "::endgroup::"
+
     - name: Get Kernel Version Info
       shell: bash
       run: |
