@@ -6207,7 +6207,6 @@ index 90bb67994688..000000000000
 -MODULE_DESCRIPTION("LZ4 compressor");
 diff --git a/lib/lz4/lz4_decompress.c b/lib/lz4/lz4_decompress.c
 deleted file mode 100644
-index fd1728d94bab..000000000000
 --- a/lib/lz4/lz4_decompress.c
 +++ /dev/null
 @@ -1,720 +0,0 @@
@@ -6720,9 +6719,9 @@ index fd1728d94bab..000000000000
 -				      (BYTE *)dest - prefixSize, NULL, 0);
 -}
 -
--int LZ4_decompress_safe_forceExtDict(const char *source, char *dest,
--				     int compressedSize, int maxOutputSize,
--				     const void *dictStart, size_t dictSize)
+-static int LZ4_decompress_safe_forceExtDict(const char *source, char *dest,
+-					    int compressedSize, int maxOutputSize,
+-					    const void *dictStart, size_t dictSize)
 -{
 -	return LZ4_decompress_generic(source, dest,
 -				      compressedSize, maxOutputSize,
@@ -6945,10 +6944,9 @@ rename from fs/f2fs/lz4armv8/lz4armv8.S
 rename to lib/lz4/lz4armv8/lz4armv8.S
 diff --git a/lib/lz4/lz4defs.h b/lib/lz4/lz4defs.h
 deleted file mode 100644
-index 673bd206aa98..000000000000
 --- a/lib/lz4/lz4defs.h
 +++ /dev/null
-@@ -1,245 +0,0 @@
+@@ -1,247 +0,0 @@
 -#ifndef __LZ4DEFS_H__
 -#define __LZ4DEFS_H__
 -
@@ -6987,6 +6985,8 @@ index 673bd206aa98..000000000000
 - */
 -
 -#include <asm/unaligned.h>
+-
+-#include <linux/bitops.h>
 -#include <linux/string.h>	 /* memset, memcpy */
 -
 -#define FORCE_INLINE __always_inline

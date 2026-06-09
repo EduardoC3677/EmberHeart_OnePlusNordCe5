@@ -568,20 +568,23 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Adding BBG"
-        cd "$CONFIG/kernel_platform"
         # NOTA: el arg 'fix_blkdev_rename' que usaba el workflow original es una
         # rama que YA NO existe en vc-teahouse/Baseband-guard (solo main y
         # release-1.0), por eso 'git clone --branch fix_blkdev_rename' fallaba y
         # BBG quedaba sin codigo aunque luego se hiciera --enable CONFIG_BBG.
-        # Usamos main (HEAD) y solo habilitamos CONFIG_BBG si el setup tuvo exito.
+        # Usamos main (HEAD) y ejecutamos el setup DESDE common/ para que el
+        # codigo de BBG y el symlink security/baseband-guard queden DENTRO de
+        # common/ (donde se compila el kernel), no en kernel_platform/. Solo se
+        # habilita CONFIG_BBG si el setup tuvo exito Y el symlink resuelve a
+        # codigo real (Kconfig presente).
+        cd "$CONFIG/kernel_platform/common"
         BBG_OK=false
         if wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash -; then
           BBG_OK=true
         else
           echo "::warning::BBG setup script failed, continuing without BBG"
         fi
-        cd common
-        if $BBG_OK && [ -e security/baseband-guard/Kconfig -o -L security/baseband-guard ]; then
+        if $BBG_OK && [ -e security/baseband-guard/Kconfig ]; then
           ./scripts/config --file arch/arm64/configs/gki_defconfig --enable CONFIG_BBG
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           echo "BBG LSM added ✅"
@@ -666,8 +669,9 @@ runs:
         apply_opt() {
           local f="$OPT_DIR/$1"
           [ -f "$f" ] || { echo "::warning::optimize patch ausente: $1"; return 0; }
-          # idempotente: si ya esta aplicado (reverse limpio), saltar.
-          if patch -p1 -R --dry-run --force --fuzz=3 <"$f" >/dev/null 2>&1; then
+          # idempotente: si ya esta aplicado (reverse limpio SIN fuzz), saltar.
+          # SIN fuzz para evitar falsos positivos de "ya aplicado".
+          if patch -p1 -R --dry-run --force <"$f" >/dev/null 2>&1; then
             echo "   $1: ya aplicado, skip"; return 0
           fi
           if patch -p1 --forward --fuzz=3 <"$f"; then
@@ -750,11 +754,25 @@ runs:
         # de arbol, se omite con warning en vez de abortar el build.
         ap()  {
           local f="$1"
-          [ -f "$f" ] || { echo "::warning::ausente $(basename "$f")"; return 0; }
-          if patch -p1 -R --dry-run --force --fuzz=3 <"$f" >/dev/null 2>&1; then
-            echo "skip (ya aplicado) $(basename "$f")"; return 0
+          local b; b="$(basename "$f")"
+          [ -f "$f" ] || { echo "::warning::ausente $b"; return 0; }
+          # Idempotencia REAL: el reverse debe encajar SIN fuzz. Con --fuzz=3 el
+          # reverse daba falsos positivos (p.ej. adjust_cpu_scan_order.patch, un
+          # cambio de 1 linea cuyo contexto fuzzy coincide en ambos sentidos),
+          # marcando como "ya aplicado" un parche que en realidad NO estaba puesto.
+          if patch -p1 -R --dry-run --force <"$f" >/dev/null 2>&1; then
+            echo "   $b: ya aplicado (reverse limpio), skip"; return 0
           fi
-          patch -p1 --forward --fuzz=3 < "$f" || echo "::warning::skip $(basename "$f")"
+          # Forward: primero limpio, luego con fuzz como ultimo recurso.
+          if patch -p1 --forward --dry-run <"$f" >/dev/null 2>&1; then
+            patch -p1 --forward <"$f" && { echo "   $b: OK"; return 0; }
+          fi
+          if patch -p1 --forward --fuzz=3 --dry-run <"$f" >/dev/null 2>&1; then
+            patch -p1 --forward --fuzz=3 <"$f" && { echo "   $b: OK (fuzz)"; return 0; }
+          fi
+          # Si ni forward ni reverse encajan, el parche NO corresponde a este arbol.
+          echo "::warning::skip $b (no aplica a este arbol; revisar contexto)"
+          return 0
         }
         apf() { ap "$1"; }   # mismo comportamiento tolerante (fuzz incluido)
 
