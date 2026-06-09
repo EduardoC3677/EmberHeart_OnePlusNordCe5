@@ -280,7 +280,19 @@ runs:
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
         MSM="$KERNEL_PATH/common"
         cd "$MSM"
-        
+
+        # Stack 802.11 base: rtw88/ath/mt76 son drivers softMAC que dependen de
+        # mac80211 + cfg80211. El gki_defconfig del Nord CE5 (MTK) NO los trae
+        # (el wifi de fabrica es el connectivity driver propietario de MediaTek),
+        # asi que sin esto rtw_core.ko queda con simbolos ieee80211_* indefinidos
+        # en modpost ("undefined!"). Ambos son tristate -> =m (rtw88 es =m y los
+        # carga como dependencia). RFKILL hace falta para cfg80211.
+        ./scripts/config --file arch/arm64/configs/gki_defconfig \
+          --module CONFIG_CFG80211 \
+          --module CONFIG_MAC80211 \
+          --enable CONFIG_RFKILL \
+          --enable CONFIG_CFG80211_WEXT
+
         # Realtek drivers
         ./scripts/config --file arch/arm64/configs/gki_defconfig \
           --enable CONFIG_WLAN_VENDOR_REALTEK
