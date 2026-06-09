@@ -443,19 +443,45 @@ runs:
             ;;
           "v2.1.0")
             cd ./KernelSU-Next
+            # Resolver de ruta para parches susfs_fix: el repo TheWildJames/kernel_patches
+            # reorganiza estos parches entre next/susfs_fix_patches/<ver>/ (plano) y
+            # next/susfs_fix_patches/stable/<ver>/. Busca en ambas ubicaciones.
+            SFX_BASE="../../../kernel_patches/next/susfs_fix_patches"
+            sf() {
+              # $1 = nombre de archivo del parche -> imprime la primera ruta existente
+              if [ -f "$SFX_BASE/$susfs_version/$1" ]; then
+                echo "$SFX_BASE/$susfs_version/$1"
+              elif [ -f "$SFX_BASE/stable/$susfs_version/$1" ]; then
+                echo "$SFX_BASE/stable/$susfs_version/$1"
+              else
+                echo ""
+              fi
+            }
+            apply_sf() {
+              # $1 = nombre de archivo; $2 = "required" para abortar si falta (default opcional)
+              local p; p="$(sf "$1")"
+              if [ -n "$p" ]; then
+                patch -p1 --forward --fuzz=3 < "$p" || true
+              elif [ "$2" = "required" ]; then
+                echo "::error::Parche SUSFS requerido ausente: $1 (buscado en $susfs_version/ y stable/$susfs_version/)"
+                exit 1
+              else
+                echo "::warning::$1 ausente en $susfs_version (ni en stable/), skip"
+              fi
+            }
             patch -p1 --forward < "../../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
             for file in $(find ./kernel -maxdepth 2 -name "*.rej" -exec basename {} .rej \;); do
               echo "Patching file: $file with fix_$file.patch"
-              patch -p1 --forward < "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_$file.patch"
+              apply_sf "fix_$file.patch"
             done
             echo "Patching Hook Mode!"
-            patch -p1 --forward < "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/overwrite_hook_mode.patch"
+            apply_sf "overwrite_hook_mode.patch"
             echo "Patching KSU_TOOLKIT Support for SusFS kernel!"
-            patch -p1 --forward < "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/ksu_toolkit.patch"
+            apply_sf "ksu_toolkit.patch"
             echo "Patching Multi-manager Support for SusFS kernel!"
-            patch -p1 --forward < "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/multi_manager.patch"
+            apply_sf "multi_manager.patch"
             echo "Patching Multi-manager sepolicy Support for SusFS kernel!"
-            patch -p1 --forward < "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/multi_sepolicy_fix.patch"
+            apply_sf "multi_sepolicy_fix.patch"
             ;;
           *)
             echo "::error::Unsupported SUSFS version: $susfs_version"
