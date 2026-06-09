@@ -558,49 +558,80 @@ runs:
         make "${MAKE_FLAGS[@]}" O=$OUT olddefconfig
         make -j$(nproc --all) "${MAKE_FLAGS[@]}" O="$OUT" modules
         make -j$(nproc --all) "${MAKE_FLAGS[@]}" O="$OUT" INSTALL_MOD_PATH="$INSTALL_MOD_PATH" modules_install
-
         cd "$KERNEL_PLATFORM"
 
-        MAKE_FLAGS+=(
-          KERNEL_SRC="$KERNEL_PLATFORM/./common"
-        )
+        # Rutas ABSOLUTAS: el build del kernel uso O=out con cwd=$MSM, asi que
+        # el out real esta en $MSM/out. Aqui cwd=$KERNEL_PLATFORM, por eso NO
+        # podemos reusar el OUT relativo ("out") -> usamos OUT_ABS.
+        OUT_ABS="$MSM/out"
 
         # ------------------------------------------------------------------
         # MediaTek MT6897: NO existen los drivers QCOM (mm-drivers, qcacld,
-        # camera-kernel, etc.). En su lugar compilamos out-of-tree el stack
-        # vendor OPLUS de memoria (hybridswap/zram), que es justo lo que el
-        # build del Image no produce y lo que la cadena de parches 0001-0006
-        # arregla. Se construyen contra el GKI ya compilado (KERNEL_SRC=common).
+        # camera-kernel, etc.). Compilamos out-of-tree el modulo vendor OPLUS
+        # hybridswap/zram (oplus_bsp_hybridswap_zram.ko + hybrid_zsmalloc.ko),
+        # que es justo lo que `make modules` del GKI NO produce y lo que la
+        # cadena de parches 0001-0006 arregla (en especial 0006: nr_objs vivo
+        # -> sin flood HYB_ZRAM en runtime). Se construye contra el GKI ya
+        # compilado en $OUT_ABS (reusa vmlinux.symvers).
+        #
+        # RECETA VERIFICADA (replica del build local que produjo el .ko bueno):
+        #   - El arbol vendor fue rsynced a $KERNEL_PLATFORM/vendor/ (SIN '../').
+        #     El bug anterior usaba '../vendor/...' -> $CONFIG/vendor (inexistente)
+        #     -> "modulo OPLUS ausente, omito" -> el .ko empaquetado quedaba stock.
+        #   - hybrid_zsmalloc.c no existe como archivo: el allocator real (zs_*)
+        #     vive en thp_zsmalloc/zsmalloc.c -> symlink para el Makefile.
+        #   - Los CONFIG_HYBRIDSWAP* deben pasarse EXPLICITOS en la linea de make
+        #     (no estan en gki_defconfig) o el obj-$(CONFIG_*) no dispara.
+        #   - HS_DEFS (-DCONFIG_*) para el preprocesador del .c.
         # ------------------------------------------------------------------
-        OPLUS_FLAGS+=(
-            CHIPSET_COMPANY=MTK
-            OPLUS_VND_BUILD_PLATFORM="$SOC"
-        )
+        MDIR="$KERNEL_PLATFORM/vendor/oplus/kernel/mm/hybridswap_zram"
+        HZ_KO="$MDIR/oplus_bsp_hybridswap_zram.ko"
+        ZS_KO="$MDIR/hybrid_zsmalloc.ko"
+        UNAME=$(ls "$INSTALL_MOD_PATH/lib/modules/")
 
-        # Modulos vendor OPLUS (rutas relativas a kernel_platform). Solo se
-        # compilan los presentes en el arbol vendor clonado.
-        EXT_OPLUS=(
-            ../vendor/oplus/kernel/mm/hybridswap_zram
-            ../vendor/oplus/kernel/mm/kswapd_opt
-            ../vendor/oplus/kernel/mm/zram_opt
-        )
-        # Algunos arboles usan thp_zsmalloc/hybrid_zsmalloc como dep del zram:
-        for extra in \
-            ../vendor/oplus/kernel/mm/thp_zsmalloc \
-            ../vendor/oplus/kernel/mm/uxmem_opt ; do
-          [ -d "$KERNEL_PLATFORM/$extra" ] && EXT_OPLUS+=("$extra")
-        done
-
-        for MODULE in "${EXT_OPLUS[@]}"; do
-            if [ ! -d "$KERNEL_PLATFORM/$MODULE" ]; then
-              echo "::warning::modulo OPLUS ausente, omito: $MODULE"; continue
+        if [ -d "$MDIR" ]; then
+            # hybrid_zsmalloc.c -> zsmalloc.c real del thp_zsmalloc vecino
+            if [ ! -e "$MDIR/hybrid_zsmalloc.c" ] && [ -f "$MDIR/../thp_zsmalloc/zsmalloc.c" ]; then
+              ln -sfn ../thp_zsmalloc/zsmalloc.c "$MDIR/hybrid_zsmalloc.c"
             fi
-            echo "== Building OPLUS module: $MODULE =="
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" modules \
-              || { echo "::warning::fallo compilando $MODULE, continuo"; continue; }
-            make -C "$MODULE" M="../$MODULE" -j$(nproc --all) "${MAKE_FLAGS[@]}" O=$MSM/out "${OPLUS_FLAGS[@]}" INSTALL_MOD_PATH=$INSTALL_MOD_PATH modules_install \
-              || echo "::warning::fallo instalando $MODULE, continuo"
-        done
+
+            # Module.symvers desde vmlinux.symvers para que modpost resuelva
+            # los simbolos del kernel base ya compilado (KMI consistente).
+            [ -f "$OUT_ABS/vmlinux.symvers" ] && cp -f "$OUT_ABS/vmlinux.symvers" "$OUT_ABS/Module.symvers"
+
+            # Regenerar infra de modulos (scripts/headers generados). No recompila vmlinux.
+            ( cd "$MSM" && make "${MAKE_FLAGS[@]}" O=out modules_prepare ) || true
+
+            HS_CONF=(
+                CONFIG_HYBRIDSWAP_ZRAM=m CONFIG_HYBRID_ZSMALLOC=m
+                CONFIG_HYBRIDSWAP=y CONFIG_HYBRIDSWAP_SWAPD=y CONFIG_HYBRIDSWAP_CORE=y
+            )
+            HS_DEFS="-DCONFIG_HYBRIDSWAP_ZRAM=1 -DCONFIG_HYBRID_ZSMALLOC=1 -DCONFIG_HYBRIDSWAP=1 -DCONFIG_HYBRIDSWAP_SWAPD=1 -DCONFIG_HYBRIDSWAP_CORE=1"
+
+            echo "== Building OPLUS module: hybridswap_zram (with 0006 fix) =="
+            make -C "$OUT_ABS" M="$MDIR" modules \
+                "${MAKE_FLAGS[@]}" \
+                "${HS_CONF[@]}" \
+                KCFLAGS="-Wno-error $HS_DEFS" \
+                || { echo "::error::fallo compilando hybridswap_zram"; exit 1; }
+
+            if [ -f "$HZ_KO" ] && [ -f "$ZS_KO" ]; then
+                echo "    OK: $(basename "$HZ_KO") + $(basename "$ZS_KO") compilados"
+                # CRITICO: depositar los .ko en el arbol que el step 'Filter modules'
+                # recoge ($INSTALL_MOD_PATH/lib/modules/$UNAME). Sin esto el .ko se
+                # compila pero NO llega al zip.
+                DEST="$INSTALL_MOD_PATH/lib/modules/$UNAME"
+                cp -f "$HZ_KO" "$ZS_KO" "$DEST/"
+                # Anexar a modules.order/modules.dep para que aparezcan en el listado
+                grep -q 'oplus_bsp_hybridswap_zram.ko' "$DEST/modules.order" 2>/dev/null || \
+                  printf 'hybrid_zsmalloc.ko\noplus_bsp_hybridswap_zram.ko\n' >> "$DEST/modules.order" 2>/dev/null || true
+                echo "    .ko OPLUS depositados en $DEST"
+            else
+                echo "::error::no se generaron los .ko vendor (hybridswap)"; exit 1
+            fi
+        else
+            echo "::error::$MDIR no existe (vendor tree no clonado correctamente)"; exit 1
+        fi
 
     - name: Filter modules
       shell: bash
