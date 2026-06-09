@@ -1003,11 +1003,61 @@ runs:
           fi
         done
         if ! $CLANG_FOUND && command -v clang >/dev/null 2>&1; then
-          CLANG_BIN="$(dirname "$(command -v clang)")"
-          CLANG_FOUND=true
-          echo "Using system clang."
+          # Solo aceptamos el clang del sistema si ademas trae la suite LLVM
+          # completa (llvm-ar). En los runners de GitHub, 'clang' existe pero
+          # 'llvm-ar' suele faltar (viene versionado o en paquete aparte), lo
+          # que rompe el build con LLVM=1. Si falta, caemos al prebuilt AOSP.
+          SYS_CLANG_BIN="$(dirname "$(command -v clang)")"
+          if command -v llvm-ar >/dev/null 2>&1 || [ -x "$SYS_CLANG_BIN/llvm-ar" ]; then
+            CLANG_BIN="$SYS_CLANG_BIN"
+            CLANG_FOUND=true
+            echo "Using system clang (llvm-ar present)."
+          else
+            echo "System clang found but llvm-ar missing; will fetch AOSP prebuilt."
+          fi
         fi
-        $CLANG_FOUND || { echo "No clang toolchain found"; exit 1; }
+        $CLANG_FOUND || {
+          # ----------------------------------------------------------------
+          # El arbol mt6897 de OnePlus NO incluye prebuilts/clang (a diferencia
+          # de los manifest QCOM). El clang del sistema (apt) trae 'clang' pero
+          # NO la suite LLVM con nombres sin sufijo (llvm-ar/llvm-nm/...), por lo
+          # que el build con LLVM=1 AR=llvm-ar falla con "llvm-ar: not found"
+          # (Error 127 en tools/bpf/resolve_btfids -> libbpf.a).
+          # Solucion: descargar el prebuilt Clang oficial de AOSP que el propio
+          # arbol declara en build.config.constants (CLANG_VERSION=rXXXXXXX).
+          # Ese tarball incluye clang, ld.lld y toda la suite llvm-* sin sufijo.
+          # ----------------------------------------------------------------
+          echo "No prebuilt clang in tree; fetching AOSP prebuilt..."
+          CV=""
+          for cf in "$KP/common/build.config.constants" "$KP/common/build.config.common"; do
+            [ -f "$cf" ] || continue
+            v=$(grep -oE '^CLANG_VERSION=[A-Za-z0-9]+' "$cf" | head -n1 | cut -d= -f2 || true)
+            if [ -n "$v" ]; then CV="$v"; break; fi
+          done
+          [ -n "$CV" ] || CV="r487747c"   # fallback conocido para android14-6.1
+          echo "Target AOSP Clang version: clang-$CV"
+          CLANG_DIR="$KP/prebuilts/clang/host/linux-x86/clang-$CV"
+          mkdir -p "$CLANG_DIR"
+          DL_OK=false
+          for BR in android14-release main android15-release; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/$BR/clang-$CV.tar.gz"
+            echo "Trying $BR ..."
+            if curl -fsSL --retry 3 --retry-delay 10 --max-time 600 "$URL" -o /tmp/clang.tar.gz; then
+              if tar xzf /tmp/clang.tar.gz -C "$CLANG_DIR" 2>/dev/null && [ -x "$CLANG_DIR/bin/clang" ]; then
+                DL_OK=true; rm -f /tmp/clang.tar.gz; break
+              fi
+            fi
+            echo "  branch $BR failed; trying next"; rm -f /tmp/clang.tar.gz
+          done
+          $DL_OK || { echo "Failed to fetch AOSP prebuilt clang-$CV"; exit 1; }
+          # Verificar que la suite LLVM esta completa (clave: llvm-ar).
+          for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip; do
+            [ -x "$CLANG_DIR/bin/$t" ] || { echo "prebuilt missing $t"; exit 1; }
+          done
+          CLANG_BIN="$CLANG_DIR/bin"
+          CLANG_FOUND=true
+          echo "AOSP prebuilt clang ready at $CLANG_BIN"
+        }
         echo "CLANG_BIN_PATH=$CLANG_BIN" >> "$GITHUB_ENV"
         CLANG_VERSION="$("$CLANG_BIN/clang" --version | head -n1)"
         echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
