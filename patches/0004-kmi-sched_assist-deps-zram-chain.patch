@@ -46,6 +46,27 @@ and modprobe proceeds to oplus_bsp_zram_opt.ko and
 oplus_bsp_hybridswap_zram.ko.
 
 ---
+diff --git a/include/trace/hooks/sched.h b/include/trace/hooks/sched.h
+index 528ad27a9..6fff05062 100755
+--- a/include/trace/hooks/sched.h
++++ b/include/trace/hooks/sched.h
+@@ -466,6 +466,14 @@ DECLARE_HOOK(android_vh_set_task_comm,
+ 	TP_PROTO(struct task_struct *p),
+ 	TP_ARGS(p));
+ 
++DECLARE_HOOK(android_vh_reweight_entity,
++	TP_PROTO(struct sched_entity *se),
++	TP_ARGS(se));
++
++DECLARE_HOOK(android_vh_sched_move_task,
++	TP_PROTO(struct task_struct *tsk),
++	TP_ARGS(tsk));
++
+ #endif /* _TRACE_HOOK_SCHED_H */
+ /* This part must be outside protection */
+ #include <trace/define_trace.h>
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 550f49a1e..913a5385a 100644
 --- a/kernel/cgroup/cgroup.c
 +++ b/kernel/cgroup/cgroup.c
 @@ -4992,6 +4992,7 @@ void css_task_iter_start(struct cgroup_subsys_state *css, unsigned int flags,
@@ -72,9 +93,11 @@ oplus_bsp_hybridswap_zram.ko.
  
  static void cgroup_procs_release(struct kernfs_open_file *of)
  {
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 62c62e0cd..a9135ffe0 100755
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -11766,6 +11766,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
+@@ -11767,6 +11767,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
  	.early_init	= true,
  	.threaded	= true,
  };
@@ -82,24 +105,12 @@ oplus_bsp_hybridswap_zram.ko.
  
  #endif	/* CONFIG_CGROUP_SCHED */
  
---- a/include/trace/hooks/sched.h
-+++ b/include/trace/hooks/sched.h
-@@ -465,6 +465,14 @@ DECLARE_HOOK(android_vh_set_task_comm,
- 	TP_PROTO(struct task_struct *p),
- 	TP_ARGS(p));
- 
-+DECLARE_HOOK(android_vh_reweight_entity,
-+	TP_PROTO(struct sched_entity *se),
-+	TP_ARGS(se));
-+
-+DECLARE_HOOK(android_vh_sched_move_task,
-+	TP_PROTO(struct task_struct *tsk),
-+	TP_ARGS(tsk));
-+
- #endif /* _TRACE_HOOK_SCHED_H */
+diff --git a/kernel/sched/vendor_hooks.c b/kernel/sched/vendor_hooks.c
+index b8059e55d..93b92fc51 100755
 --- a/kernel/sched/vendor_hooks.c
 +++ b/kernel/sched/vendor_hooks.c
-@@ -117,3 +117,5 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_prio_restore);
+@@ -117,3 +117,5 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_prio_inheritance);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_prio_restore);
  EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_task_ux_op);
  EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_set_task_comm);
 +EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_reweight_entity);
