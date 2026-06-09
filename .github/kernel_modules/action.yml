@@ -652,9 +652,24 @@ runs:
         cd modules
         # Download default module list
         curl -L -o default_modules.txt https://raw.githubusercontent.com/nullptr-t-oss/kernel_patches/refs/heads/main/default_modules.txt
-        # Remove modules in the default list
 
+        # CRITICO: el fix hybridswap/zram (0006) vive en estos .ko vendor OPLUS.
+        # La default_modules.txt los lista (oplus_bsp_hybridswap_zram.ko,
+        # oplus_bsp_zram_opt.ko) y el filtro los borraria -> el zip saldria SIN
+        # el .ko corregido (justo el bug que estamos arreglando). Los protegemos
+        # explicitamente: nunca se eliminan aunque esten en la lista.
+        KEEP_MODULES="oplus_bsp_hybridswap_zram.ko hybrid_zsmalloc.ko oplus_bsp_zram_opt.ko"
+        is_protected() {
+          local m; for m in $KEEP_MODULES; do [ "$1" = "$m" ] && return 0; done; return 1
+        }
+
+        # Remove modules in the default list (excepto los protegidos)
         while IFS= read -r module; do
+          [ -z "$module" ] && continue
+          if is_protected "$(basename "$module")"; then
+            echo "KEEP (fix hybridswap/zram): $module"
+            continue
+          fi
           if [ -e "$module" ]; then
             rm -f "$module"
             echo "Removed module: $module"
@@ -662,6 +677,10 @@ runs:
         done < default_modules.txt
         cd ..
         echo "Modules remaining after filtering: $(find modules -type f -name '*.ko' | wc -l)"
+        echo "== Verificacion: .ko OPLUS del fix presentes en el zip =="
+        for k in oplus_bsp_hybridswap_zram.ko hybrid_zsmalloc.ko; do
+          if [ -f "modules/$k" ]; then echo "  OK presente: $k"; else echo "::error::FALTA $k en el zip final"; exit 1; fi
+        done
 
     - name: Create Kernel Modules zip
       id: create_zip
