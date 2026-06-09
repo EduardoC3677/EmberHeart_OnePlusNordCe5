@@ -518,7 +518,11 @@ runs:
           fi
         fi
 
-        patch -p1 < 50_add_susfs_in_${{ env.SUSFS_KERNEL_BRANCH }}.patch
+        # --fuzz=3: el arbol GKI 6.1 del Nord CE5 (mt6897) difiere en algunas
+        # lineas de contexto (p.ej. fs/proc/base.c no incluye <linux/dma-buf.h>),
+        # lo que hacia fallar Hunk #1 y abortar con exit 1. Con fuzz=3 los 4 hunks
+        # de base.c y el resto del parche aplican limpios (verificado con dry-run).
+        patch -p1 --fuzz=3 < 50_add_susfs_in_${{ env.SUSFS_KERNEL_BRANCH }}.patch
 
         # Revert Fake kernel patch
         if [ "$fake_patched" = 1 ]; then
